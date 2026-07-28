@@ -272,7 +272,7 @@ def get_template_code(cve: str) -> Optional[str]:
             f'    # Request {i+1}: {method} {path}\n'
             f'    r{i} = s.request("{method}", target + "{path}", '
             f'headers={headers!r}' + (f', data={body!r}' if body else '') + f', verify=False, timeout=10)\n'
-            f'    print(f"[{{i+1}}] {method} {path} -> HTTP {{r{i}.status_code}}")\n'
+            f'    print(f"[{i+1}] {method} {path} -> HTTP {{r{i}.status_code}}")\n'
         )
 
     matchers_code = ""
