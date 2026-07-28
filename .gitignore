@@ -4,3 +4,4 @@ __pycache__/
 data/vuln.db
 poc/
 .venv/
+nuclei-templates/
