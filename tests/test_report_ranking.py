@@ -56,3 +56,22 @@ def test_render_report_shows_risk_band():
     assert "CVE-2099-HOT" in html
     # EPSS percentage surfaced
     assert "EPSS" in html
+
+
+def test_kev_flag_boosts_and_renders_badge():
+    # A finding carrying kev=True (set by _enrich_kev) must get the in-the-wild boost even
+    # when it is NOT in the top-level exploited_in_wild list, and the report shows a KEV badge.
+    findings = json.dumps({
+        "stack": [{"type": "cms", "name": "joomla", "version": "4.2"}],
+        "vulnerabilities": [
+            {"cve": "CVE-2023-23752", "verified": "EXPLOITABLE", "cvss": 5.3,
+             "severity": "medium", "kev": True, "title": "info disclosure",
+             "verify_reason": "config leaked: db credential reflected"},
+        ],
+    })
+    rep = _run(runner.run_report("https://j.test", findings))
+    item = rep["exploitable"][0]
+    assert item["kev"] is True
+    assert any("wild" in fct.lower() or "kev" in fct.lower() for fct in item["risk_factors"])
+    html = "".join(rich.render_report(rep, "scanKEV"))
+    assert "KEV" in html

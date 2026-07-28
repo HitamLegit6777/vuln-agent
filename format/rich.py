@@ -87,6 +87,8 @@ def _sev_line(v: dict) -> str:
     epss = v.get("epss")
     if isinstance(epss, (int, float)):
         line += f" · EPSS {epss:.0%}"
+    if v.get("kev"):
+        line += " · <b>KEV</b>"
     return line
 
 

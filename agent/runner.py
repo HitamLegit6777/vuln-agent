@@ -291,6 +291,34 @@ async def _enrich_epss(cands: list) -> None:
             v["epss_percentile"] = info.get("percentile")
 
 
+async def _enrich_kev(cands: list) -> set:
+    """Mark candidates that appear in the CISA KEV catalog (`v['kev'] = True`) using ONE
+    catalog load (membership test against the full set). Grounds `exploited_in_wild` in the
+    authoritative source instead of trusting the research LLM. Returns the set of matched
+    CVE ids (uppercased). Best-effort: returns empty set and mutates nothing on failure."""
+    cves = {str(v.get("cve")).upper() for v in cands if v.get("cve")}
+    if not cves:
+        return set()
+    try:
+        from scrapers.cisa_kev import CisaKevScraper
+        try:
+            from db import cache_get, cache_set
+            scraper = CisaKevScraper(cache_get=cache_get, cache_set=cache_set)
+        except Exception:
+            scraper = CisaKevScraper()
+        data = await scraper._load()
+        await scraper.close()
+    except Exception:
+        return set()
+    catalog = {str(v.get("cveID", "")).upper()
+               for v in (data.get("vulnerabilities") or [])}
+    matched = cves & catalog
+    for v in cands:
+        if str(v.get("cve")).upper() in matched:
+            v["kev"] = True
+    return matched
+
+
 async def run_verify(findings_str: str, scan_id: str, target: str,
                      progress: Optional[Callable[[int, str], Awaitable]] = None
                      ) -> str:
@@ -322,6 +350,17 @@ async def run_verify(findings_str: str, scan_id: str, target: str,
     # so risk scoring in run_report is grounded. Degrades silently if FIRST.org unreachable.
     try:
         await _enrich_epss(cands)
+    except Exception:
+        pass
+
+    # ENRICH: mark candidates present in the CISA KEV catalog (authoritative in-the-wild),
+    # and fold them into exploited_in_wild so the report + scoring reflect real KEV status
+    # rather than the research LLM's guess. Degrades silently if CISA unreachable.
+    try:
+        kev_matched = await _enrich_kev(cands)
+        if kev_matched:
+            eiw = {str(c).upper() for c in (f.get("exploited_in_wild") or [])}
+            f["exploited_in_wild"] = sorted(eiw | kev_matched)
     except Exception:
         pass
 
@@ -386,6 +425,8 @@ async def run_report(target: str, findings: str) -> dict:
             # reconcile score+severity from possibly-partial source data (vector or label)
             score, sev = _cvss.enrich(v.get("cvss"), v.get("severity"),
                                       v.get("cvss_vector") or v.get("vector"))
+            cve_up = str(cve).upper()
+            in_kev = bool(v.get("kev")) or cve_up in itw_set
             item = {
                 "cve": cve, "label": "EXPLOITABLE", "verified": "EXPLOITABLE",
                 "severity": sev or v.get("severity"), "cvss": score if score is not None else v.get("cvss"),
@@ -394,11 +435,11 @@ async def run_report(target: str, findings: str) -> dict:
                 "verify_reason": (v.get("verify_reason") or "")[:300],
                 "poc_refs": v.get("poc_refs", []), "diff_patch": v.get("diff_patch"),
                 "sources": v.get("sources", []),
-                "epss": v.get("epss"),
+                "epss": v.get("epss"), "kev": in_kev,
             }
             item.update(_scoring.score_finding(
-                item, epss=v.get("epss"),
-                exploited_in_wild=str(cve).upper() in itw_set))
+                item, epss=v.get("epss"), kev=in_kev,
+                exploited_in_wild=in_kev))
             exploitable.append(item)
         elif verified:  # NOT EXPLOITABLE / UNKNOWN -> checked
             checked.append({"cve": cve, "verify_reason": (v.get("verify_reason") or "")[:120] or verified})

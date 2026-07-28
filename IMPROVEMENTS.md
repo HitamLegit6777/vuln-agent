@@ -22,6 +22,13 @@ prioritization capability so reports lead with what actually matters.
 - Wired into `run_verify` via `_enrich_epss()` — one batched call annotates every
   candidate with its real EPSS score before scoring. Live API verified (Log4Shell -> 0.99999).
 
+### CISA KEV grounding — `run_verify._enrich_kev()`
+- The in-the-wild signal is now grounded in the authoritative CISA KEV catalog instead of
+  trusting the research LLM. One catalog load, set-membership against all candidates; matched
+  CVEs are marked `kev=True` and folded into `exploited_in_wild`.
+- Feeds the risk score's in-the-wild boost and shows a `KEV` badge in the report.
+- Best-effort: silent no-op if CISA is unreachable. Live catalog verified.
+
 ### Deterministic risk scoring — `agent/scoring.py`
 - `score_finding()` fuses signals into a 0-100 priority + coarse band:
   verified-on-target verdict (dominant), CISA-KEV/in-the-wild, EPSS, CVSS, PoC availability.
