@@ -24,6 +24,9 @@ class ProbeResult:
     body: str = ""
     # auxiliary endpoint probes (path -> (status, snippet))
     aux: dict = field(default_factory=dict)
+    # raw Set-Cookie headers, preserved as a proper list (httpx get_list) so cookie
+    # values containing commas (e.g. Expires=Wed, 09 Jun 2021) aren't mangled.
+    raw_cookies: list = field(default_factory=list)
     error: Optional[str] = None
 
     @property
@@ -40,6 +43,10 @@ class ProbeResult:
 
     @property
     def cookies(self) -> list[str]:
+        # Prefer the correctly-split list captured at probe time; fall back to the
+        # (imperfect) comma-split only if raw_cookies wasn't populated.
+        if self.raw_cookies:
+            return self.raw_cookies
         return self.headers.get("set-cookie", "").split(",") if self.headers.get("set-cookie") else []
 
 
@@ -71,6 +78,7 @@ async def probe(url: str, client: Optional[httpx.AsyncClient] = None) -> ProbeRe
         res.final_url = str(r.url)
         res.status = r.status_code
         res.headers = {k.lower(): v for k, v in r.headers.items()}
+        res.raw_cookies = list(r.headers.get_list("set-cookie"))
         res.body = r.text[:200000]
     except Exception as e:
         res.error = f"{type(e).__name__}: {e}"
@@ -82,6 +90,7 @@ async def probe(url: str, client: Optional[httpx.AsyncClient] = None) -> ProbeRe
                 res.final_url = str(r.url)
                 res.status = r.status_code
                 res.headers = {k.lower(): v for k, v in r.headers.items()}
+                res.raw_cookies = list(r.headers.get_list("set-cookie"))
                 res.body = r.text[:200000]
                 res.error = None  # HTTPS worked
             except Exception as e2:
