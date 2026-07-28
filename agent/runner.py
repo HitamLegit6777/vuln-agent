@@ -141,9 +141,10 @@ _RESEARCH_MAX_STEPS = 15   # was 40 — pre-research does the heavy lifting, AI 
 _RESEARCH_FORCE_NUDGE_AT = 10
 
 
-async def _pre_research(target: str, progress=None) -> tuple[str, dict]:
+async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
     """Phase 1: detect stack + parallel search_vuln + parallel fetch_cve_detail.
-    Returns (stack_json, search_results_json, cve_details_json) — all pre-computed."""
+    Returns (pre_research_text, stack_data, precomputed_vulns) — all pre-computed.
+    `precomputed_vulns` is a CVE-keyed candidate map used as the research fallback."""
     if progress:
         try: await progress(0, "detecting stack...")
         except: pass
@@ -184,13 +185,28 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict]:
     search_results = await asyncio.gather(*search_tasks)
 
     # collect CVEs to fetch details for (VULNERABLE/UNCONFIRMED only — no limit, all of them)
+    # and, at the same time, build a precomputed candidate map keyed by CVE so the research
+    # fallback can still report real candidates if the AI-review loop never emits findings.
     cves_to_fetch = []
+    precomputed_vulns: dict = {}
     for name, version, result in search_results:
         try:
             data = json.loads(result)
             for r in (data.get("results") or []):
                 if r.get("match") is not False and r.get("cve"):
-                    cves_to_fetch.append(r["cve"])
+                    cve = str(r["cve"]).upper()
+                    cves_to_fetch.append(cve)
+                    label = "VULNERABLE" if r.get("match") is True else "UNCONFIRMED"
+                    prev = precomputed_vulns.get(cve)
+                    # prefer a VULNERABLE label over UNCONFIRMED if seen from multiple components
+                    if prev is None or (prev.get("label") != "VULNERABLE" and label == "VULNERABLE"):
+                        precomputed_vulns[cve] = {
+                            "cve": cve, "label": label,
+                            "component": name, "version": version,
+                            "title": r.get("title"), "severity": r.get("severity"),
+                            "cvss": r.get("cvss"), "sources": [r.get("source")] if r.get("source") else [],
+                            "url": r.get("url"),
+                        }
         except Exception:
             pass
     cves_to_fetch = list(set(cves_to_fetch))
@@ -221,7 +237,7 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict]:
         for cve, detail in fetch_results
     )
     pre_research = f"STACK:\n{stack_obs[:4000]}\n\nSEARCH RESULTS:\n{search_ctx[:15000]}\n\nCVE DETAILS:\n{detail_ctx[:15000]}"
-    return pre_research, stack_data
+    return pre_research, stack_data, precomputed_vulns
 
 
 async def run_research(target: str,
@@ -243,7 +259,7 @@ async def run_research(target: str,
         knowledge_ctx = ""
 
     # Phase 1: parallel pre-research (no AI — pure tool I/O)
-    pre_research, stack_data = await _pre_research(target, progress)
+    pre_research, stack_data, precomputed_vulns = await _pre_research(target, progress)
 
     # Phase 2: AI review — feed pre-computed data, AI emits findings
     sys_prompt = bp.RESEARCH_SYSTEM
@@ -262,8 +278,9 @@ async def run_research(target: str,
         {"role": "user", "content": f"Analyze target: {target}\n\n{pre_research[:30000]}\n\nReview and emit findings JSON."},
     ]
     transcript: list[str] = [f"[pre-research] {pre_research[:300]}"]
-    # accumulation (fallback)
-    acc: dict = {"stack": [], "vulns": {}, "target": target}
+    # accumulation (fallback). Seed vulns from the precomputed candidate map so an
+    # all-steps-exhausted run still reports the real VULNERABLE/UNCONFIRMED candidates.
+    acc: dict = {"stack": [], "vulns": dict(precomputed_vulns), "target": target}
     # pre-populate acc from stack_data
     try:
         comps = stack_data.get("components", []) + stack_data.get("services", [])
@@ -306,14 +323,8 @@ async def run_research(target: str,
         messages.append({"role": "user",
             "content": "Respond with a tool call {\"tool\":..,\"args\":..} OR the findings JSON object."})
 
-    # fallback: build from pre-research + accumulated data
-    # parse search results to build vulns
-    try:
-        # re-parse from pre_research context is complex; use acc
-        for name, ver, result in []:
-            pass  # acc was pre-populated
-    except Exception:
-        pass
+    # fallback: build from pre-research + accumulated data (acc was pre-populated
+    # from stack_data above; the AI-review loop fills acc["vulns"] when it emits findings).
     vulns = sorted(acc["vulns"].values(),
                    key=lambda v: (0 if v["label"] == "VULNERABLE" else 1, -(v.get("cvss") or 0)))
     fallback = {"target": target, "stack": acc["stack"], "vulnerabilities": _filter_vulns(vulns),
