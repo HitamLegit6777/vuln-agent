@@ -41,12 +41,15 @@ async def chat_stream(model: str, messages: list[dict], temperature: float = 0.2
     parts: list[str] = []
     reasoning: list[str] = []
     try:
-        # read timeout 120s = if no token for 120s, kill (router hung)
-        # hard timeout via wait_for = overall limit (timeout param)
+        # read timeout: if no byte arrives for `read_timeout`s the stream is killed
+        # (router hung mid-response). hard timeout via wait_for = overall wall-clock
+        # limit (the `timeout` param). Both are now actually enforced.
+        read_timeout = min(120.0, float(timeout))
+
         async def _do_stream():
             async with _client_obj().stream(
                 "POST", "/chat/completions", json=payload,
-                timeout=httpx.Timeout(None, connect=15.0, write=30.0, pool=30.0),
+                timeout=httpx.Timeout(read_timeout, connect=15.0, write=30.0, pool=30.0),
             ) as r:
                 if r.status_code >= 400:
                     body = await r.aread()
@@ -66,7 +69,7 @@ async def chat_stream(model: str, messages: list[dict], temperature: float = 0.2
                         parts.append(ch["content"])
                     if ch.get("reasoning_content"):
                         reasoning.append(ch["reasoning_content"])
-        await _do_stream()
+        await asyncio.wait_for(_do_stream(), timeout=timeout)
     except asyncio.TimeoutError:
         # hard timeout — return partial result if we have any
         if not parts and not reasoning:
