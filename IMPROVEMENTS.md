@@ -47,6 +47,27 @@ prioritization capability so reports lead with what actually matters.
   immediately overwritten by `recommendation = ""` (dead code). Now short-circuits and
   keeps its message.
 
+### Codebase read-through (full sweep for latent bugs)
+- **`scrapers/nvd.py`: hostname typo `services.nvd.nvd.nist.gov` (doubled `nvd`).** The NVD
+  API host never resolved (gaierror), so *every* NVD lookup silently returned nothing — the
+  single most authoritative CVE/CVSS/affected-range source was 100% dead. Fixed to
+  `services.nvd.nist.gov`; live-verified (Log4Shell -> CRITICAL/10.0, 373 ranges). Also
+  fixed the same typo in a `config.py` comment.
+- **`agent/runner.py`: `os` was used in `run_poc` (nuclei paths) but never imported at
+  module scope** -> `NameError` at runtime whenever the nuclei branch ran. Added the
+  module-level `import os` and removed a shadowing local `import os as _os`.
+- **`scrapers/nuclei_templates.py` PoC codegen emitted a runtime `f"[{i+1}]"`** into the
+  *generated* PoC source, where `i` (the generation-time loop variable) does not exist at
+  run time -> the auto-generated PoC crashed with `NameError` before issuing any request
+  (this is the no-binary YAML->Python fallback path). Now the request index is baked in as
+  a literal (`[1]`, `[2]`, ...). Guarded by `tests/test_nuclei_codegen.py` (compiles, no
+  runtime `{i}`, and executes without `NameError`).
+- `scrapers/registry.py`: `AffectedRange` was listed in `__all__` but never imported ->
+  `from scrapers.registry import *` raised. Added it to the `.base` import.
+- `detect/cms.py`: parenthesized four fragile `A or B and C` fingerprint expressions
+  (PrestaShop / vBulletin / WHMCS / Squarespace) whose precedence was correct-but-brittle,
+  and removed a dead `readme` local. No behavior change; guards against future edits.
+
 ## Tests — `tests/` (new; repo had none)
 Offline, deterministic, network/LLM/Telegram all stubbed. Run: `python3 -m pytest`.
 - `test_version_match.py` — the version-range matching engine (accuracy-critical).
@@ -56,5 +77,8 @@ Offline, deterministic, network/LLM/Telegram all stubbed. Run: `python3 -m pytes
 - `test_report.py` / `test_report_ranking.py` — report bucketing, UNREACHABLE regression,
   end-to-end risk ordering + rendered RISK band.
 - `test_enrich_epss.py` — EPSS enrichment wiring + best-effort failure behavior.
+- `test_extract_json.py` — balanced-brace JSON extraction (fences, trailing prose, braces
+  inside strings, escapes).
+- `test_nuclei_codegen.py` — nuclei YAML->Python PoC generation is runtime-safe.
 
-88 tests, all passing.
+109 tests, all passing.
