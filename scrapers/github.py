@@ -33,20 +33,17 @@ def _parse_ranges(affected: list) -> list[AffectedRange]:
         for rng in a.get("ranges", []) or []:
             if rng.get("type") != "SEMVER":
                 continue
-            lo = hi_exc = None
+            lo = hi_exc = hi_inc = None
             for ev in rng.get("events", []) or []:
                 if "introduced" in ev:
                     lo = ev["introduced"] or "0"
                 if "fixed" in ev:
                     hi_exc = ev["fixed"]
                 if "last_affected" in ev:
-                    hi_exc = None  # last_affected → inclusive handled below
+                    hi_inc = ev["last_affected"]  # inclusive upper bound (no fix release)
             out.append(AffectedRange(product=prod, ecosystem=eco,
                                      min_inclusive=lo if lo and lo != "0" else None,
-                                     max_exclusive=hi_exc))
-            # explicit version list fallback
-        if a.get("versions") and not out:
-            pass
+                                     max_exclusive=hi_exc, max_inclusive=hi_inc))
     return out
 
 
