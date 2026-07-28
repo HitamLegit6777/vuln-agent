@@ -360,19 +360,24 @@ async def run_report(target: str, findings: str) -> dict:
             checked.append({"cve": cve, "verify_reason": (v.get("verify_reason") or "")[:120] or verified})
     status = "EXPLOITABLE" if exploitable else "CLEAN"
 
-    # Check if target was unreachable (no stack + probe error in notes)
+    # Check if target was unreachable (no stack + nothing checked = probe never got data)
     stack_empty = not stack and not exploitable and not checked
-    notes_str = " ".join(f.get("summary", "") for f in [f] if isinstance(f, dict))
     if stack_empty:
-        status = "UNREACHABLE"
+        # Short-circuit: nothing to recommend patching, just tell the user it was unreachable.
         recommendation = ("Target tidak bisa dijangkau dari server. Kemungkinan down, "
                           "firewall block, atau DNS tidak resolve. Coba lagi nanti atau "
                           "gunakan URL alternatif (HTTPS/WWW).")
+        return {"target": target, "stack_summary": stack_summary, "status": "UNREACHABLE",
+                "exploitable": [], "checked": [],
+                "exploited_in_wild": f.get("exploited_in_wild", []),
+                "recommendation": recommendation,
+                "waf": f.get("waf", []),
+                "waf_summary": f.get("waf_summary", ""),
+                "waf_may_mask": f.get("waf_may_mask", False)}
 
-    # LLM writes ONLY the recommendation (cannot add CVEs — list is already fixed above)
-    recommendation = ""
+    # Deterministic recommendation (no LLM meta-text risk). The CVE list is already fixed
+    # above from the `verified` field, so this text cannot introduce new/hallucinated CVEs.
     if exploitable:
-        # deterministic recommendation (no LLM meta-text risk)
         cve_list = ", ".join(v["cve"] for v in exploitable[:5])
         cms_name = next((s.get("name") for s in stack if s.get("type") in ("cms", "core")), "")
         cms_ver = next((s.get("version") for s in stack if s.get("type") in ("cms", "core")), "")

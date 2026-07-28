@@ -62,7 +62,9 @@ def _poc_menu_kb(scan_id: str, vulns: list) -> InlineKeyboardMarkup:
         if not cve:
             continue
         sev = (v.get("severity") or "?").upper()[:4]
-        label = (v.get("label") or "?").upper()[:4]
+        # findings use `label` (VULNERABLE/UNCONFIRMED); reports use `verified`
+        # (EXPLOITABLE/NOT EXPLOITABLE). Show whichever is present.
+        label = (v.get("verified") or v.get("label") or "?").upper()[:4]
         rows.append([InlineKeyboardButton(f"{cve} [{sev} {label}]",
                                           callback_data=f"poc:{scan_id}:{cve}")])
     rows.append([InlineKeyboardButton("« back", callback_data=f"back:{scan_id}")])
@@ -160,7 +162,7 @@ async def _run_scan_bg(update: Update, bot, user_id: int, target: str, scan_id: 
                 log.info("self-reflect: %s", lessons[:100])
         except Exception:
             pass
-        kb = _main_kb(scan_id, report.get("exploitable", []) or report.get("vulns", []))
+        kb = _main_kb(scan_id, _report_cves(report))
         chunks = rich.render_report(report, scan_id)
         try:
             await msg.delete()
@@ -531,13 +533,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         row = await db.get_scan(scan_id)
         report = json.loads(row["report"]) if row and row.get("report") else {}
         await q.edit_message_reply_markup(
-            reply_markup=_poc_menu_kb(scan_id, report.get("vulns", [])))
+            reply_markup=_poc_menu_kb(scan_id, _report_cves(report)))
     elif data.startswith("back:"):
         _, scan_id = data.split(":", 1)
         row = await db.get_scan(scan_id)
         report = json.loads(row["report"]) if row and row.get("report") else {}
         await q.edit_message_reply_markup(
-            reply_markup=_main_kb(scan_id, report.get("vulns", [])))
+            reply_markup=_main_kb(scan_id, _report_cves(report)))
     elif data.startswith("chat:"):
         _, scan_id = data.split(":", 1)
         _active_chat[update.effective_user.id] = scan_id
@@ -559,6 +561,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def _e(s):
     import html
     return html.escape(str(s) if s is not None else "")
+
+
+def _report_cves(report: dict) -> list:
+    """All actionable CVEs from a rendered report: exploitable first, then checked.
+
+    The report schema stores verified findings under `exploitable` and tested-but-safe
+    ones under `checked` (never `vulns`). Both are offered for PoC retrieval so the user
+    can pull the script for anything the agent looked at.
+    """
+    if not isinstance(report, dict):
+        return []
+    out: list = []
+    seen: set = set()
+    for bucket in ("exploitable", "checked", "vulns"):
+        for v in report.get(bucket, []) or []:
+            cve = v.get("cve")
+            if cve and cve not in seen:
+                seen.add(cve)
+                out.append(v)
+    return out
 
 
 def main():
