@@ -23,22 +23,84 @@ _JSON_OBJ_RE = re.compile(r"\{.*\}", re.S)
 _CHAT_MAX_STEPS = 12
 
 
+def _first_balanced_json(text: str) -> Optional[dict]:
+    """Scan for the first complete, brace-balanced JSON object in text.
+
+    String/escape aware, so braces inside string values don't break balancing. This handles
+    the common LLM shapes: a bare object, an object followed by trailing prose/reasoning, or
+    an object with nested objects. Returns the first object that parses, else None.
+    """
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, n):
+            c = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[i:j + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            return obj
+                    except json.JSONDecodeError:
+                        break  # this '{' didn't yield valid JSON; advance past it
+        i += 1
+    return None
+
+
 def _extract_json(text: str) -> Optional[dict]:
+    """Extract a JSON object from an LLM response.
+
+    Order of attempts:
+      1. strip markdown fences, then try to parse the whole thing (fast path);
+      2. a brace-balanced, string-aware scan for the first complete object (handles trailing
+         prose / reasoning after the JSON, and braces inside strings);
+      3. legacy greedy first-`{`..last-`}` slice as a last resort.
+    """
     if not text:
         return None
-    m = _JSON_OBJ_RE.search(text)
-    if not m:
-        return None
-    s = m.group(0)
+    stripped = _strip_fences(text)
+    # fast path: the fenced/stripped body IS the object
     try:
-        return json.loads(s)
+        obj = json.loads(stripped)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
-        for i in range(len(s), 0, -1):
-            try:
-                return json.loads(s[:i])
-            except json.JSONDecodeError:
-                continue
-        return None
+        pass
+    # robust path: balanced-brace scan (try stripped first, then raw)
+    for src in (stripped, text):
+        obj = _first_balanced_json(src)
+        if obj is not None:
+            return obj
+    # last resort: greedy slice (legacy behavior)
+    m = _JSON_OBJ_RE.search(text)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 def _strip_fences(text: str) -> str:
