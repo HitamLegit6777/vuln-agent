@@ -15,6 +15,8 @@ from typing import Optional, Callable, Awaitable
 from llm import chat_detect, chat_report
 from agent import blueprint as bp
 from agent.tools import dispatch as _dispatch
+from agent import scoring as _scoring
+from scrapers import cvss as _cvss
 import db as _db
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.S)
@@ -341,23 +343,35 @@ async def run_report(target: str, findings: str) -> dict:
 
     exploitable = []
     checked = []
+    itw_list = f.get("exploited_in_wild", []) or []
+    itw_set = {str(c).upper() for c in itw_list}
     for v in vulns:
         cve = v.get("cve")
         if not cve:
             continue
         verified = str(v.get("verified", "")).upper()
         if verified == "EXPLOITABLE":
-            exploitable.append({
-                "cve": cve, "label": "EXPLOITABLE",
-                "severity": v.get("severity"), "cvss": v.get("cvss"),
+            # reconcile score+severity from possibly-partial source data (vector or label)
+            score, sev = _cvss.enrich(v.get("cvss"), v.get("severity"),
+                                      v.get("cvss_vector") or v.get("vector"))
+            item = {
+                "cve": cve, "label": "EXPLOITABLE", "verified": "EXPLOITABLE",
+                "severity": sev or v.get("severity"), "cvss": score if score is not None else v.get("cvss"),
                 "component": v.get("component"), "title": v.get("title"),
                 "summary": (v.get("description") or v.get("summary") or "")[:200],
                 "verify_reason": (v.get("verify_reason") or "")[:300],
                 "poc_refs": v.get("poc_refs", []), "diff_patch": v.get("diff_patch"),
                 "sources": v.get("sources", []),
-            })
+                "epss": v.get("epss"),
+            }
+            item.update(_scoring.score_finding(
+                item, epss=v.get("epss"),
+                exploited_in_wild=str(cve).upper() in itw_set))
+            exploitable.append(item)
         elif verified:  # NOT EXPLOITABLE / UNKNOWN -> checked
             checked.append({"cve": cve, "verify_reason": (v.get("verify_reason") or "")[:120] or verified})
+    # rank exploitable so the highest-risk (verified + in-the-wild + high EPSS/CVSS) leads
+    exploitable.sort(key=lambda x: x.get("risk", 0.0), reverse=True)
     status = "EXPLOITABLE" if exploitable else "CLEAN"
 
     # Check if target was unreachable (no stack + nothing checked = probe never got data)

@@ -77,7 +77,17 @@ def _sev_line(v: dict) -> str:
     label = (v.get("label") or "UNKNOWN").upper()
     label_tag = {"VULNERABLE": "VULNERABLE", "NOT_AFFECTED": "NOT AFFECTED"}.get(label, label)
     cvss_str = f" CVSS {cvss}" if cvss else ""
-    return f"[{_e(sev)}{_e(cvss_str)}] <b>{_e(label_tag)}</b>"
+    line = f"[{_e(sev)}{_e(cvss_str)}] <b>{_e(label_tag)}</b>"
+    # deterministic risk band (from agent.scoring) — priority at a glance
+    band = v.get("risk_band")
+    risk = v.get("risk")
+    if band:
+        risk_str = f" {risk:.0f}" if isinstance(risk, (int, float)) else ""
+        line += f" · <b>RISK {_e(band)}{_e(risk_str)}</b>"
+    epss = v.get("epss")
+    if isinstance(epss, (int, float)):
+        line += f" · EPSS {epss:.0%}"
+    return line
 
 
 def render_report(report: dict, scan_id: str) -> list[str]:
