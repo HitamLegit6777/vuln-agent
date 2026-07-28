@@ -337,7 +337,7 @@ def _save_learned_sig(cms_name, signal_type, signal_value, evidence):
         else:
             c.execute(
                 "INSERT INTO learned_signatures(cms_name,signal_type,signal_value,"
-                "evidence,hit_count,created,last_seen) VALUES(?,?,?,1,1,?,?)",
+                "evidence,hit_count,created,last_seen) VALUES(?,?,?,?,1,?,?)",
                 (cms_name, signal_type, signal_value, evidence,
                  time.strftime("%Y-%m-%d %H:%M:%S"),
                  time.strftime("%Y-%m-%d %H:%M:%S")))
