@@ -23,6 +23,7 @@ from .cisa_kev import CisaKevScraper
 from .poc_github import PoCGitHubScraper
 from .watchtowr import WatchTowrScraper
 from .cve5 import Cve5Scraper
+from .epss import EPSSScraper
 from .news import BleepingComputerScraper
 from .joomla_security import JoomlaSecurityScraper
 
@@ -44,6 +45,7 @@ def build_scrapers(client: Optional[httpx.AsyncClient] = None,
         CisaKevScraper(**kw),          # in-the-wild exploitation flag
         PoCGitHubScraper(**kw),        # PoC repo discovery
         WatchTowrScraper(**kw),        # 1day analysis + PoC
+        EPSSScraper(**kw),             # exploit-probability enrichment (annotates raw.epss)
         BleepingComputerScraper(**kw),  # real-world incident news (per-CVE enrichment)
     ]
 
