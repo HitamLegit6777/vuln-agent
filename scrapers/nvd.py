@@ -10,7 +10,7 @@ from typing import Optional
 
 from .base import BaseScraper, VulnRecord, AffectedRange
 
-NVD_URL = "https://services.nvd.nvd.nist.gov/rest/json/cves/2.0"
+NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 _CPE_RE = re.compile(r"cpe:(?P<cve>2\.3):(?P<part>[a-z]):(?P<vendor>[^:]*):(?P<product>[^:]*):(?P<ver>[^:]*):")
 
 

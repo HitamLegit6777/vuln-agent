@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import uuid
 from typing import Optional, Callable, Awaitable
@@ -805,8 +806,7 @@ async def run_poc(scan_id: str, cve: str, target: str) -> dict:
     if v == "EXPLOITABLE" and saved_path:
         try:
             # read the saved PoC code from the file
-            import os as _os
-            if _os.path.exists(saved_path):
+            if os.path.exists(saved_path):
                 code = open(saved_path).read()
                 method = methods_tried[0] if methods_tried else "LLM-generated"
                 vuln_type = ""

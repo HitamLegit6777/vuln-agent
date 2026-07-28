@@ -11,7 +11,7 @@ from typing import Optional
 
 import httpx
 
-from .base import BaseScraper, VulnRecord
+from .base import BaseScraper, VulnRecord, AffectedRange
 from .nvd import NVDScraper
 from .github import GitHubAdvisoryScraper
 from .osv import OSVScraper

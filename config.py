@@ -31,7 +31,7 @@ HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 USER_AGENT = os.getenv("USER_AGENT", "vuln-agent/1.0 (+security-research)")
 
 # NVD API key (free, https://nvd.nist.gov/developers/request-an-api-key) — raises rate limit
-# 5->50 req/30s. Only helps where services.nvd.nvd.nist.gov is network-reachable.
+# 5->50 req/30s. Only helps where services.nvd.nist.gov is network-reachable.
 NVD_API_KEY = os.getenv("NVD_API_KEY", "")
 # optional HTTPS proxy to reach NVD if your host is IP-blocked by NIST
 HTTPS_PROXY = os.getenv("HTTPS_PROXY", "")

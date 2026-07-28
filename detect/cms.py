@@ -139,8 +139,8 @@ def _identify_cms(p: ProbeResult, learned_sigs: list = None) -> tuple[Optional[s
         return "magento", ver, ev_s
 
     # PrestaShop
-    if "prestashop" in gen.lower() or "x-powered-by" in p.headers and "prestashop" in p.headers["x-powered-by"].lower() \
-            or "/modules/" in body and "prestashop" in body.lower():
+    if "prestashop" in gen.lower() or ("x-powered-by" in p.headers and "prestashop" in p.headers["x-powered-by"].lower()) \
+            or ("/modules/" in body and "prestashop" in body.lower()):
         ver = None
         m = re.search(r'PrestaShop\s*/?\s*([0-9][0-9.]+)', gen, re.I)
         if m:
@@ -184,7 +184,7 @@ def _identify_cms(p: ProbeResult, learned_sigs: list = None) -> tuple[Optional[s
         return "modx", (m.group(1) if m else None), [f"generator={gen}"]
 
     # vBulletin
-    if "vbulletin" in gen.lower() or "vbulletin_global.js" in body or "/forum/" in body and "vbulletin" in body.lower():
+    if "vbulletin" in gen.lower() or "vbulletin_global.js" in body or ("/forum/" in body and "vbulletin" in body.lower()):
         m = re.search(r'vBulletin\s*([0-9][0-9.]+)', gen, re.I)
         ev_s = [f"generator={gen}"] if gen else []
         if "vbulletin_global.js" in body:
@@ -211,7 +211,7 @@ def _identify_cms(p: ProbeResult, learned_sigs: list = None) -> tuple[Optional[s
         return "oscommerce", (m.group(1) if m else None), ev_s
 
     # WHMCS
-    if "whmcs" in p.headers.get("x-powered-by", "").lower() or "whmcs" in body.lower() and "/whmcs/" in body:
+    if "whmcs" in p.headers.get("x-powered-by", "").lower() or ("whmcs" in body.lower() and "/whmcs/" in body):
         return "whmcs", None, [f"X-Powered-By: {p.headers.get('x-powered-by', '')}"]
 
     # Nextcloud
@@ -244,7 +244,7 @@ def _identify_cms(p: ProbeResult, learned_sigs: list = None) -> tuple[Optional[s
         return "wix", None, ["X-Wix header / wixstatic.com in body"]
 
     # Squarespace (SaaS)
-    if "x-squarespace" in p.headers or "squarespace" in body.lower() and "squarespace.com" in body:
+    if "x-squarespace" in p.headers or ("squarespace" in body.lower() and "squarespace.com" in body):
         return "squarespace", None, ["X-Squarespace header"]
 
     # Static site generators (no CVEs but detection)
@@ -294,9 +294,6 @@ async def _enumerate_wp(p: ProbeResult, client) -> list[Component]:
         seen_p.add(slug)
         ev_url = f"/wp-content/plugins/{slug}/"
         ver = None
-        # try readme.txt stable tag
-        readme = p.aux.get(f"/wp-content/plugins/{slug}/readme.txt")
-        # not in aux by default; fetch on demand
         comp = Component(name=slug, type="plugin", version=ver, evidence=ev_url)
         comps.append(comp)
     seen_t: set[str] = set()
