@@ -266,6 +266,31 @@ async def run_research(target: str,
 _VERIFY_CAP = 100  # effectively no cap — verify ALL VULNERABLE candidates (accuracy > speed)
 
 
+async def _enrich_epss(cands: list) -> None:
+    """Annotate each candidate dict with its real EPSS score (`v['epss']`) via one batched
+    FIRST.org call. Best-effort: on any failure the candidates are left unchanged (their
+    risk score simply omits the EPSS term). Mutates in place."""
+    cves = [str(v.get("cve")).upper() for v in cands if v.get("cve")]
+    if not cves:
+        return
+    try:
+        from scrapers.epss import EPSSScraper
+        try:
+            from db import cache_get, cache_set
+            scraper = EPSSScraper(cache_get=cache_get, cache_set=cache_set)
+        except Exception:
+            scraper = EPSSScraper()
+        scores = await scraper._fetch(cves)
+        await scraper.close()
+    except Exception:
+        return
+    for v in cands:
+        info = scores.get(str(v.get("cve")).upper())
+        if info and info.get("epss") is not None:
+            v["epss"] = info["epss"]
+            v["epss_percentile"] = info.get("percentile")
+
+
 async def run_verify(findings_str: str, scan_id: str, target: str,
                      progress: Optional[Callable[[int, str], Awaitable]] = None
                      ) -> str:
@@ -292,6 +317,13 @@ async def run_verify(findings_str: str, scan_id: str, target: str,
     cands.sort(key=lambda v: (0 if str(v.get("label")).upper() == "VULNERABLE" else 1,
                               -(v.get("cvss") or 0)))
     cands = cands[:_VERIFY_CAP]
+
+    # ENRICH: batch-fetch real EPSS (exploit probability) for all candidates in one call,
+    # so risk scoring in run_report is grounded. Degrades silently if FIRST.org unreachable.
+    try:
+        await _enrich_epss(cands)
+    except Exception:
+        pass
 
     # PARALLEL PoC verification — 10 subagents concurrent, NO timeout (let them finish)
     _verify_sem = asyncio.Semaphore(10)
