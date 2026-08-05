@@ -245,10 +245,19 @@ def _cache_get_sync(key):
             return None
 
 
+_cache_writes = 0
+
+
 def _cache_set_sync(key, value):
+    global _cache_writes
     with _conn() as c:
         c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
                   (key, json.dumps(value, default=str), time.time()))
+        # opportunistic purge: every ~100 writes, delete expired rows so the
+        # cache table can't grow unbounded over long uptime
+        _cache_writes += 1
+        if _cache_writes % 100 == 0:
+            c.execute("DELETE FROM cache WHERE ts < ?", (time.time() - _CACHE_TTL,))
 
 
 async def cache_get(key):

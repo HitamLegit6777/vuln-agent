@@ -129,8 +129,9 @@ async def run_nuclei(cve: str, target: str, timeout: int = 60) -> dict:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        # kill the orphaned nuclei process tree — otherwise it keeps scanning
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # kill the orphaned nuclei process tree — a cancel from an outer wait_for
+        # (verify's 600s cap) would otherwise keep it scanning the target
         try:
             proc.kill()
             await proc.wait()

@@ -193,24 +193,34 @@ async def t_webfetch(url: str, max_chars: int = 10000) -> str:
             return f"ERR {type(e).__name__}: {e}"
 
 
-async def _playwright_fetch(url: str, max_chars: int = 10000) -> str:
+async def _playwright_fetch(url: str, max_chars: int = 10000, timeout: float = 45.0) -> str:
     """Fetch a URL using headless Chromium (bypasses Cloudflare JS challenge).
-    Runs in a thread to avoid blocking the asyncio event loop."""
+    Bounded by wait_for + browser.close() in finally (no Chromium leak on failure)."""
     import asyncio
     def _sync_fetch():
         from playwright.sync_api import sync_playwright
         from bs4 import BeautifulSoup
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            import time
-            time.sleep(3)  # wait for CF challenge to resolve
-            html = page.content()
-            browser.close()
-            soup = BeautifulSoup(html, "lxml")
-            return soup.get_text(" ", strip=True)[:max_chars]
-    return await asyncio.to_thread(_sync_fetch)
+        browser = None
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                import time
+                time.sleep(3)  # wait for CF challenge to resolve
+                html = page.content()
+                soup = BeautifulSoup(html, "lxml")
+                return soup.get_text(" ", strip=True)[:max_chars]
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_sync_fetch), timeout=timeout)
+    except asyncio.TimeoutError:
+        return "ERR playwright timeout"
 
 
 async def t_save_poc(scan_id: str, cve: str, code: str, filename: str = "") -> str:
