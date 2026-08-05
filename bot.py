@@ -628,13 +628,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await db.set_setting("model_report", "")
             await q.message.reply_html("<b>Model reset ke default config.</b>")
         elif len(parts) == 3:
-            from llm import set_models
             role, model_id = parts[1], parts[2]
-            if role in ("detect", "report"):
-                set_models(**{role: model_id})
-                await db.set_setting(f"model_{role}", model_id)
+            if await _select_model(role, model_id):
                 await q.message.reply_html(
                     f"<b>Model {role} →</b> <code>{_e(model_id)}</code>")
+            else:
+                await q.message.reply_html(
+                    f"<b>Model tidak valid / provider unavailable:</b> <code>{_e(model_id)}</code>")
 
 
 def _e(s):
@@ -662,27 +662,32 @@ def _report_cves(report: dict) -> list:
     return out
 
 
+async def _select_model(role: str, model_id: str) -> bool:
+    """Persist + activate a provider-validated model id."""
+    if role not in ("detect", "report") or not model_id:
+        return False
+    from llm import set_models, fetch_available_models
+    models = await fetch_available_models()
+    if not models or model_id not in models:
+        return False
+    set_models(**{role: model_id})
+    await db.set_setting(f"model_{role}", model_id)
+    return True
+
+
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """View / switch the active LLM models (detect + report) from the provider."""
     if not _gate(update):
         return await _unauthorized(update)
     from llm import get_models, set_models, fetch_available_models
     cur = get_models()
-    args = [a for a in (ctx.args or [])]
+    args = list(ctx.args or [])
     if len(args) == 2 and args[0].lower() in ("detect", "report"):
         role, model_id = args[0].lower(), args[1]
-        # validate against the provider list — a typo would silently break every LLM call
-        models = await fetch_available_models()
-        if models and model_id not in models:
+        if not await _select_model(role, model_id):
             return await update.effective_message.reply_html(
-                f"<b>Model tidak ditemukan di provider:</b> <code>{_e(model_id)}</code>\n"
+                f"<b>Model tidak ditemukan / provider unavailable:</b> <code>{_e(model_id)}</code>\n"
                 f"<i>Gunakan</i> <code>/model list</code> <i>utk liat model yg tersedia.</i>")
-        if role == "detect":
-            set_models(detect=model_id)
-            await db.set_setting("model_detect", model_id)
-        else:
-            set_models(report=model_id)
-            await db.set_setting("model_report", model_id)
         return await update.effective_message.reply_html(
             f"<b>Model {role} →</b> <code>{_e(model_id)}</code>\n"
             f"<i>Berlaku untuk scan berikutnya.</i>")
@@ -693,8 +698,6 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await db.set_setting("model_report", "")
             return await update.effective_message.reply_html(
                 "<b>Model reset ke default config.</b>")
-        # list = fall through to full listing
-    # fetch provider models
     models = await fetch_available_models()
     if not models:
         return await update.effective_message.reply_html(
@@ -702,22 +705,24 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"detect: <code>{_e(cur['detect'])}</code>\n"
             f"report: <code>{_e(cur['report'])}</code>\n\n"
             "<i>Provider tidak merespon /models — coba lagi nanti.</i>")
-    # filter to relevant prefixes (al/* and common combos), cap display
     short = [m for m in models if m.startswith(("al/", "co/"))][:40]
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🔍 detect: {_e(m)}", callback_data=f"model:detect:{m}")]
-        for m in short[:15]
-    ] + [
-        [InlineKeyboardButton(f"📝 report: {_e(m)}", callback_data=f"model:report:{m}")]
-        for m in short[15:30]
-    ] + [[InlineKeyboardButton("↩️ Reset default", callback_data="model:reset")]])
+    buttons = []
+    for model_id in short[:15]:
+        data = f"model:detect:{model_id}"
+        if len(data.encode("utf-8")) <= 64:
+            buttons.append([InlineKeyboardButton(f"🔍 detect: {model_id}", callback_data=data)])
+    for model_id in short[15:30]:
+        data = f"model:report:{model_id}"
+        if len(data.encode("utf-8")) <= 64:
+            buttons.append([InlineKeyboardButton(f"📝 report: {model_id}", callback_data=data)])
+    buttons.append([InlineKeyboardButton("↩️ Reset default", callback_data="model:reset")])
     await update.effective_message.reply_html(
         f"<b>Model aktif:</b>\n"
         f"detect: <code>{_e(cur['detect'])}</code>\n"
         f"report: <code>{_e(cur['report'])}</code>\n\n"
         f"<i>Pilih model (dari provider, {len(short)} tampil):</i>\n"
         f"<code>/model detect &lt;id&gt;</code> atau <code>/model report &lt;id&gt;</code>",
-        reply_markup=kb)
+        reply_markup=InlineKeyboardMarkup(buttons))
 
 
 def main():

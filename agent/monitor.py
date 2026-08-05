@@ -134,7 +134,6 @@ class VulnMonitor:
         SECONDARY: search_all across 30+ product queries (CMS/servers/frameworks/panels/DBs)."""
         from scrapers.registry import build_scrapers, search_all
         from scrapers.wordfence import WordfenceScraper
-        import time as _time
         from datetime import datetime, timezone, timedelta
         cutoff = datetime.now(timezone.utc) - timedelta(days=_RECENCY_DAYS)
         scrapers = build_scrapers()
@@ -154,9 +153,7 @@ class VulnMonitor:
                 return d >= cutoff
             except ValueError:
                 return True
-        current_year = str(_time.gmtime().tm_year)  # keep as fallback context
 
-        # (seen/all_cves initialized above — no dup)
         wf = None
         try:
             # 1. PRIMARY: Wordfence threat-intel DB listing (all recent CVEs)

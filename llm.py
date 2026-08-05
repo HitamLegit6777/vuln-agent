@@ -133,7 +133,7 @@ async def chat_stream(model: str, messages: list[dict], temperature: float = 0.2
             try:
                 await asyncio.wait_for(_do_stream(), timeout=timeout)
                 break  # stream completed
-            except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            except httpx.TransportError as e:
                 if parts or reasoning or _attempt >= _RETRIES:
                     if not parts and not reasoning:
                         raise RuntimeError(f"stream HTTP error: {type(e).__name__}: {e}")

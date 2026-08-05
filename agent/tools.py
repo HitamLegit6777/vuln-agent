@@ -225,14 +225,15 @@ async def _playwright_fetch(url: str, max_chars: int = 10000, timeout: float = 4
 
 async def t_save_poc(scan_id: str, cve: str, code: str, filename: str = "") -> str:
     """Save a generated PoC script to disk + db (so chat agent can read it back). Returns path."""
+    safe_scan = re.sub(r"[^A-Za-z0-9_-]", "_", scan_id or "adhoc")
     safe_cve = re.sub(r"[^A-Za-z0-9_-]", "_", cve or "vuln")
-    # sanitize the LLM-supplied filename — strip dirs/separators so it can NEVER escape config.POC
+    # sanitize every LLM/user-controlled path component so it can NEVER escape config.POC
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename or "")
     safe_name = safe_name.lstrip(".").strip("/\\")
-    fname = safe_name or f"poc_{scan_id}_{safe_cve}.py"
+    fname = safe_name or f"poc_{safe_scan}_{safe_cve}.py"
     path = (config.POC / fname).resolve()
     if path.parent != config.POC.resolve():
-        path = config.POC / f"poc_{scan_id}_{safe_cve}.py"
+        path = config.POC / f"poc_{safe_scan}_{safe_cve}.py"
     path.write_text(code, encoding="utf-8")
     try:
         from db import save_poc
