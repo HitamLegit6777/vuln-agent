@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import os
-import sys
+import re
 import time
 from pathlib import Path
 
@@ -78,6 +78,17 @@ _active_chat: dict[int, str] = {}
 _active_jobs: dict[int, dict[str, dict]] = {}
 _MAX_JOBS_PER_USER = 3
 
+def _prune_active_jobs():
+    """Drop finished jobs so _active_jobs can't grow unbounded across a long bot uptime.
+    Keeps the last 10 done entries per user for /jobs context, prunes the rest."""
+    for uid, jobs in list(_active_jobs.items()):
+        done = [(sid, j) for sid, j in jobs.items() if j.get("done")]
+        if len(done) > 10:
+            for sid, _ in sorted(done, key=lambda x: x[1].get("started", ""))[:len(done) - 10]:
+                jobs.pop(sid, None)
+        if not jobs:
+            _active_jobs.pop(uid, None)
+
 # vuln monitor
 _monitor: VulnMonitor = None
 
@@ -111,6 +122,7 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     # cap concurrent jobs per user
     user_jobs = _active_jobs.setdefault(user_id, {})
+    _prune_active_jobs()
     active = [sid for sid, j in user_jobs.items() if not j.get("done")]
     if len(active) >= _MAX_JOBS_PER_USER:
         return await update.effective_message.reply_html(
@@ -157,7 +169,7 @@ async def _run_scan_bg(update: Update, bot, user_id: int, target: str, scan_id: 
                            grounded=findings_str)
         # SELF-IMPROVEMENT: AI reflects on the scan and writes lessons learned
         try:
-            lessons = await runner.run_self_reflect(target, findings_str, report, scan_id)
+            lessons = await runner.run_self_reflect(target, findings_str, scan_id)
             if lessons:
                 log.info("self-reflect: %s", lessons[:100])
         except Exception:
@@ -186,8 +198,8 @@ async def _run_scan_bg(update: Update, bot, user_id: int, target: str, scan_id: 
                                    parse_mode=ParseMode.HTML)
         except Exception:
             pass
-    finally:
         _active_jobs.setdefault(user_id, {}).setdefault(scan_id, {})["done"] = True
+        _prune_active_jobs()
         try:
             await db.update_job(scan_id, "done")
         except Exception:
@@ -467,16 +479,28 @@ async def _do_chat(update: Update, scan_id: str, question: str):
 
 
 def _split_html(text: str, limit: int = 3500) -> list[str]:
+    """Split long HTML for Telegram, never cutting mid-tag. If a chunk ends inside an
+    unclosed <b>/<i>/<code> tag, the opener is re-added at the front of the next chunk
+    (Telegram requires balanced tags per message)."""
     if len(text) <= limit:
         return [text]
     out, cur = [], ""
+    pending_open = ""
     for para in text.split("\n\n"):
         if len(cur) + len(para) > limit:
             if cur:
                 out.append(cur)
-            cur = para
+            cur = pending_open + para if pending_open else para
         else:
             cur = (cur + "\n\n" + para) if cur else para
+        # track which simple tags are still open at the end of cur
+        opens = re.findall(r"<(b|i|code|em|strong)>", cur)
+        closes = re.findall(r"</(b|i|code|em|strong)>", cur)
+        pending = [t for t in opens if opens.count(t) > closes.count(t)]
+        pending_open = "".join(f"<{t}>" for t in dict.fromkeys(pending))
+        if pending_open and len(cur) + len(pending_open) > limit:
+            out.append(cur)
+            cur = pending_open
     if cur:
         out.append(cur)
     return out

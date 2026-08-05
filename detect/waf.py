@@ -67,7 +67,7 @@ _HEADER_EXACT = {
     "x-fastly-request-id": ("fastly", "cdn"),
     # AWS
     "x-amz-cf-id": ("aws-cloudfront", "cdn"),
-    "x-amzn-trace-id": ("aws-waf", "waf"),
+    # x-amzn-trace-id is set by plain ALB/ECS, not just AWS WAF → NOT a WAF signal
     "x-amz-cf-pop": ("aws-cloudfront", "cdn"),
     # Edgecast
     "ec-region": ("edgecast", "cdn"),
@@ -90,7 +90,7 @@ _HEADER_EXACT = {
     "x-px3-t": ("perimeterx", "waf"),
     # Kasada (JS-challenge WAF)
     "x-kasada-proxy": ("kasada", "waf"),
-    "kp-d:": ("kasada", "waf"),
+    # (kp-d: had a trailing colon — never matches a real header; removed)
     # Reblaze
     "x-reblaze": ("reblaze", "waf"),
     "rb-zid": ("reblaze", "waf"),
@@ -167,13 +167,13 @@ _VIA_PATTERNS = [
 _COOKIE_PATTERNS = [
     (re.compile(r"__cfduid|__cf_bm|cf_clearance|__cf_chl", re.I), ("cloudflare", "waf", "medium")),
     (re.compile(r"sucuri_cloudproxy_uuid|sucuri_sucuri", re.I), ("sucuri", "waf", "medium")),
-    (re.compile(r"incap_ses|visid_incap|nlbi_|rehi=|__utmvc", re.I), ("imperva", "waf", "medium")),
+    (re.compile(r"incap_ses|visid_incap|nlbi_|rehi=", re.I), ("imperva", "waf", "medium")),
     (re.compile(r"BIGipServer", re.I), ("f5-bigip", "waf", "medium")),
     (re.compile(r"__ddos_guard|ddos_guard", re.I), ("ddos-guard", "waf", "medium")),
     (re.compile(r"qrator_jsid|qrator_ssid", re.I), ("qrator", "waf", "medium")),
     (re.compile(r"datadome|_dd_s|dd_cookie", re.I), ("datadome", "waf", "medium")),
     (re.compile(r"_px|pxcts|pxhd|perimeterx", re.I), ("perimeterx", "waf", "medium")),
-    (re.compile(r"SERVERID", re.I), ("ha-proxy", "proxy", "low")),
+    (re.compile(r"^SERVERID=", re.I), ("ha-proxy", "proxy", "low")),
     (re.compile(r"PSMobile.*?wt_zcp", re.I), ("imperva", "waf", "low")),
 ]
 
@@ -235,7 +235,7 @@ _BLOCK_STATUS = {403, 406, 418, 429, 503}
 
 # WordPress plugin WAFs detectable via body/headers on the site itself (not just block pages)
 _WP_WAF_BODY_PATTERNS = [
-    (re.compile(r"wp-content/plugins/wordfence|wordfence.*waf|wf.*hash", re.I),
+    (re.compile(r"wp-content/plugins/wordfence|wordfence.*(?:waf|firewall|blocked)|wfWAF", re.I),
      ("wordfence", "waf", "high")),
     (re.compile(r"wp-content/plugins/better-wp-security|ithemes-security", re.I),
      ("ithemes-security", "waf", "medium")),
@@ -250,12 +250,15 @@ _WP_WAF_BODY_PATTERNS = [
 ]
 
 
-def detect_waf(headers: dict, body: str = "", status: int = 0) -> list[WAFResult]:
+def detect_waf(headers: dict, body: str = "", status: int = 0,
+               cookies: Optional[list] = None) -> list[WAFResult]:
     """Detect WAF/CDN/proxy layers from HTTP response. Returns all detected layers.
 
     headers: lowercase-keyed dict.
     body: response body (first ~200KB is enough).
     status: HTTP status code (403/406/429 on normal GET = likely WAF).
+    cookies: full Set-Cookie list (probe's raw_cookies). If None, falls back to the
+             (possibly collapsed) set-cookie header value.
     """
     results: list[WAFResult] = []
     seen: set[str] = set()
@@ -312,11 +315,12 @@ def detect_waf(headers: dict, body: str = "", status: int = 0) -> list[WAFResult
                 _add(name, kind, f"Via: {via[:80]}")
                 break
 
-    # 4. Cookie patterns
-    cookie_str = headers.get("set-cookie", "")
-    if cookie_str:
+    # 4. Cookie patterns — check EVERY Set-Cookie (headers dict collapses duplicates,
+    #    so the probe's raw cookie list is authoritative when available)
+    cookie_values = cookies if cookies else ([headers.get("set-cookie", "")] if headers.get("set-cookie") else [])
+    for cookie_str in cookie_values:
         for pat, (name, kind, conf) in _COOKIE_PATTERNS:
-            if pat.search(cookie_str):
+            if pat.search(cookie_str or ""):
                 _add(name, kind, f"cookie: {pat.pattern[:40]}", conf)
 
     # 5. Body block-page patterns (specific WAF signatures)

@@ -105,27 +105,51 @@ def _dedupe(records: list[VulnRecord]) -> list[VulnRecord]:
     return list(seen_cve.values()) + others
 
 
-async def search_all(scrappers: list[BaseScraper], query: str,
-                     version: Optional[str] = None) -> list[VulnRecord]:
+_PER_SOURCE_TIMEOUT = 30.0  # one hung scraper (e.g. Cloudflare-challenged page) must not stall the aggregate
+
+
+async def _aggregate(scrappers: list[BaseScraper], query: str, version, is_get: bool) -> list[VulnRecord]:
+    """Shared get_all/search_all body with aggregate-level caching.
+    The merged record list is cached under one key per query (TTL via the pluggable
+    cache) so a repeat CVE lookup during bot uptime never re-scrapes every source."""
+    cache_get = next((s._cache_get for s in scrappers if s._cache_get), None)
+    cache_set = next((s._cache_set for s in scrappers if s._cache_set), None)
+    key = f"agg:{'get' if is_get else 'search'}:{query}:{version or ''}"
+    if cache_get:
+        try:
+            hit = await cache_get(key)
+            if hit:
+                return [VulnRecord.from_dict(d) for d in hit if isinstance(d, dict)]
+        except Exception:
+            pass
+
     async def _one(s: BaseScraper):
         try:
-            return await s.search(query, version)
+            if is_get:
+                r = await asyncio.wait_for(s.get(query), timeout=_PER_SOURCE_TIMEOUT)
+                return [r] if r else []
+            return await asyncio.wait_for(s.search(query, version), timeout=_PER_SOURCE_TIMEOUT)
         except Exception:
             return []
-    results = await asyncio.gather(*[_one(s) for s in scrappers], return_exceptions=False)
+
+    results = await asyncio.gather(*[_one(s) for s in scrappers], return_exceptions=True)
     flat = [r for sub in results for r in (sub or [])]
-    return _dedupe(flat)
+    recs = _dedupe(flat)
+    if cache_set and recs:
+        try:
+            await cache_set(key, [r.to_dict() for r in recs])
+        except Exception:
+            pass
+    return recs
+
+
+async def search_all(scrappers: list[BaseScraper], query: str,
+                     version: Optional[str] = None) -> list[VulnRecord]:
+    return await _aggregate(scrappers, query, version, is_get=False)
 
 
 async def get_all(scrappers: list[BaseScraper], cve: str) -> list[VulnRecord]:
-    async def _one(s: BaseScraper):
-        try:
-            r = await s.get(cve)
-            return [r] if r else []
-        except Exception:
-            return []
-    results = await asyncio.gather(*[_one(s) for s in scrappers])
-    return _dedupe([r for sub in results for r in (sub or [])])
+    return await _aggregate(scrappers, cve, None, is_get=True)
 
 
 __all__ = ["VulnRecord", "AffectedRange", "build_scrapers",

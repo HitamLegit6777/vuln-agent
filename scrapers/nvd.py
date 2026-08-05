@@ -58,7 +58,9 @@ class NVDScraper(BaseScraper):
         cve = _extract_cve(cve_or_id) or cve_or_id
         if not cve.startswith("CVE-"):
             return None
-        data = await self._get_json(NVD_URL, params={"cveId": cve})
+        data = await self._cached(
+            f"nvd:{cve}",
+            lambda: self._get_json(NVD_URL, params={"cveId": cve}))
         if not data or not data.get("vulnerabilities"):
             return None
         return self._parse_cve(data["vulnerabilities"][0]["cve"], None)

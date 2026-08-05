@@ -44,7 +44,7 @@ async def chat_stream(model: str, messages: list[dict], temperature: float = 0.2
         # read timeout: if no byte arrives for `read_timeout`s the stream is killed
         # (router hung mid-response). hard timeout via wait_for = overall wall-clock
         # limit (the `timeout` param). Both are now actually enforced.
-        read_timeout = min(120.0, float(timeout))
+        read_timeout = min(300.0, float(timeout))  # reasoning models can think >120s before first token
 
         async def _do_stream():
             async with _client_obj().stream(
@@ -53,6 +53,9 @@ async def chat_stream(model: str, messages: list[dict], temperature: float = 0.2
             ) as r:
                 if r.status_code >= 400:
                     body = await r.aread()
+                    # 5xx / 524 (Cloudflare origin timeout) are transient — retryable
+                    if r.status_code >= 500:
+                        raise httpx.RemoteProtocolError(f"router {r.status_code}: {body[:200]!r}")
                     raise RuntimeError(f"router {r.status_code}: {body[:300]!r}")
                 async for line in r.aiter_lines():
                     if not line or not line.startswith("data:"):
@@ -69,7 +72,23 @@ async def chat_stream(model: str, messages: list[dict], temperature: float = 0.2
                         parts.append(ch["content"])
                     if ch.get("reasoning_content"):
                         reasoning.append(ch["reasoning_content"])
-        await asyncio.wait_for(_do_stream(), timeout=timeout)
+        # transient router failures (ReadTimeout/ConnectError/5xx) are retried with
+        # backoff, but only when nothing was streamed yet — partial answers are kept
+        _RETRIES = 3
+        _attempt = 0
+        while True:
+            _attempt += 1
+            try:
+                await asyncio.wait_for(_do_stream(), timeout=timeout)
+                break  # stream completed
+            except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                if parts or reasoning or _attempt >= _RETRIES:
+                    if not parts and not reasoning:
+                        raise RuntimeError(f"stream HTTP error: {type(e).__name__}: {e}")
+                    break
+                await asyncio.sleep(2.0 * _attempt)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"LLM timeout after {timeout}s (router hung — no response)")
     except asyncio.TimeoutError:
         # hard timeout — return partial result if we have any
         if not parts and not reasoning:

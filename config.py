@@ -7,7 +7,9 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env")
+    # override=True: .env wins over stale shell env vars (e.g. ROUTER_BASE left
+    # from an old setup) — the file is the source of truth for this deployment
+    load_dotenv(Path(__file__).parent / ".env", override=True)
 except Exception:
     pass
 

@@ -5,3 +5,5 @@ data/vuln.db
 poc/
 .venv/
 nuclei-templates/
+doman.txt
+data/edb.csv

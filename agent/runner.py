@@ -139,6 +139,7 @@ def _filter_vulns(vulns: list) -> list:
 
 _RESEARCH_MAX_STEPS = 15   # was 40 — pre-research does the heavy lifting, AI just reviews
 _RESEARCH_FORCE_NUDGE_AT = 10
+_PRE_FETCH_CAP = 20        # max CVE-detail fetches in pre-research (each = full 14-source get_all)
 
 
 async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
@@ -177,10 +178,11 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
     # 1b. parallel search_vuln for ALL components (timeout 90s — don't hang forever)
     async def _search(name, version):
         try:
-            return name, version, await _dispatch("search_vuln", {"query": name, "version": version})
+            res = await asyncio.wait_for(
+                _dispatch("search_vuln", {"query": name, "version": version}), timeout=90)
+            return name, version, res
         except Exception as e:
-            return name, version, f'{{"error":"{e}"}}'
-
+            return name, version, f'{{"error":"{type(e).__name__}"}}'
     search_tasks = [_search(n, v) for n, v in search_items]
     search_results = await asyncio.gather(*search_tasks)
 
@@ -209,7 +211,11 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
                         }
         except Exception:
             pass
-    cves_to_fetch = list(set(cves_to_fetch))
+    # rank: VULNERABLE first, then cvss desc; cap the detail-fetch set so pre-research
+    # doesn't do hundreds of full get_all() calls (each is 14 sources × network)
+    _ranked = sorted(precomputed_vulns.values(),
+                     key=lambda v: (0 if v["label"] == "VULNERABLE" else 1, -(v.get("cvss") or 0)))
+    cves_to_fetch = [v["cve"] for v in _ranked[:_PRE_FETCH_CAP]]
 
     if progress:
         try: await progress(2, f"fetching {len(cves_to_fetch)} CVE details (parallel)...")
@@ -220,10 +226,10 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
     async def _fetch(cve):
         async with _fetch_sem:
             try:
-                return cve, await _dispatch("fetch_cve_detail", {"cve": cve})
+                return cve, await asyncio.wait_for(
+                    _dispatch("fetch_cve_detail", {"cve": cve}), timeout=90)
             except Exception as e:
-                return cve, f"ERR: {e}"
-
+                return cve, f"ERR: {type(e).__name__}"
     fetch_tasks = [_fetch(cve) for cve in cves_to_fetch]
     fetch_results = await asyncio.gather(*fetch_tasks)
 
@@ -233,7 +239,7 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
         for name, ver, result in search_results
     )
     detail_ctx = "\n\n---\n\n".join(
-        f"fetch_cve_detail({cve}):\n{detail[:3000]}"
+        f"fetch_cve_detail({cve}):\n{detail[:1500]}"
         for cve, detail in fetch_results
     )
     pre_research = f"STACK:\n{stack_obs[:4000]}\n\nSEARCH RESULTS:\n{search_ctx[:15000]}\n\nCVE DETAILS:\n{detail_ctx[:15000]}"
@@ -404,21 +410,8 @@ async def run_verify(findings_str: str, scan_id: str, target: str,
         return findings_str
     cands = [v for v in f.get("vulnerabilities", []) if v.get("cve")
              and str(v.get("label", "")).upper().replace("-", "_") != "NOT_AFFECTED"]
-    # ALWAYS try JCE (CVE-2026-48907) for Joomla sites — it's a plugin (version-independent),
-    # unauth PHP-upload RCE, CVSS 10.0, in-the-wild (CISA KEV/BOD 26-04). PoC widely spread.
-    stack = f.get("stack", []) or []
-    is_joomla = any((s.get("name") or "").lower() == "joomla" for s in stack)
-    existing = {str(v.get("cve")).upper() for v in cands}
-    if is_joomla and "CVE-2026-48907" not in existing:
-        cands.append({
-            "cve": "CVE-2026-48907", "label": "UNCONFIRMED",
-            "component": "plugin:jce (always-test, Joomla)",
-            "title": "JCE editor unauth PHP upload RCE", "severity": "CRITICAL", "cvss": 10.0,
-            "sources": ["cve5"], "_always_test": True,
-        })
     cands.sort(key=lambda v: (0 if str(v.get("label")).upper() == "VULNERABLE" else 1,
                               -(v.get("cvss") or 0)))
-    cands = cands[:_VERIFY_CAP]
 
     # ENRICH: batch-fetch real EPSS (exploit probability) for all candidates in one call,
     # so risk scoring in run_report is grounded. Degrades silently if FIRST.org unreachable.
@@ -451,7 +444,12 @@ async def run_verify(findings_str: str, scan_id: str, target: str,
                 try: await progress(_done_count, f"verify PoC {cve} ({_done_count+1}/{_total})")
                 except: pass
             try:
-                res = await run_poc(scan_id, cve, target)
+                # wall-clock cap per candidate — run_poc's LLM loop is bounded by steps
+                # but 30 steps × slow reasoning model can still stall the whole scan
+                res = await asyncio.wait_for(run_poc(scan_id, cve, target), timeout=600)
+            except asyncio.TimeoutError:
+                res = {"verdict": "NOT EXPLOITABLE", "reason": "verify timeout (600s per candidate)",
+                       "attempts": 0, "path": ""}
             except Exception as e:
                 res = {"verdict": "NOT EXPLOITABLE", "reason": f"verify err: {e}", "attempts": 0, "path": ""}
         # SERVER-SIDE PROOF VALIDATION: downgrade EXPLOITABLE if no direct proof
@@ -628,31 +626,8 @@ def _validate_exploitable(verdict: str, reason: str) -> tuple[str, str]:
 
 async def run_poc(scan_id: str, cve: str, target: str) -> dict:
     """PoC exploitability agent: build -> run --check -> iterate on failure.
-    Returns {path, verdict, reason, attempts, methods_tried} from ACTUAL execution.
-    For CVE-2026-48907 (Joomla JCE), uses a pre-built super-accurate PoC (no LLM)."""
+    Returns {path, verdict, reason, attempts, methods_tried} from ACTUAL execution."""
     cve_u = cve.upper()
-    # Pre-built JCE PoC (always-test on Joomla) — bypass LLM generation
-    if cve_u == "CVE-2026-48907":
-        try:
-            from agent.jce_poc import JCE_POC_SOURCE
-            from agent.tools import t_save_poc, t_run_poc_check
-            path = await t_save_poc(scan_id, cve, JCE_POC_SOURCE)
-            fp = json.loads(path).get("path", "")
-            run_out = await t_run_poc_check(scan_id, cve, target)
-            v, reason = _parse_run_verdict(run_out if isinstance(run_out, str) else json.dumps(run_out))
-            if not v:
-                # parse from raw output as fallback
-                v, reason = _parse_run_verdict(run_out if isinstance(run_out, str) else "")
-            if not v:
-                v = "NOT EXPLOITABLE"
-                reason = (run_out[:500] if isinstance(run_out, str) else json.dumps(run_out)[:500])
-            return {"path": fp, "verdict": v, "reason": reason,
-                    "attempts": 1, "methods_tried": ["pre-built JCE PoC (--check)"]}
-        except Exception as e:
-            return {"path": "", "verdict": "NOT EXPLOITABLE",
-                    "reason": f"JCE PoC run err: {type(e).__name__}: {e}",
-                    "attempts": 1, "methods_tried": ["pre-built JCE PoC"]}
-
     # Nuclei template — community-verified PoC (4167+ CVEs). Run BEFORE LLM generation:
     # nuclei's matchers are accurate (not LLM-guessed). Only fall through to LLM if no template.
     try:
@@ -818,7 +793,8 @@ async def run_poc(scan_id: str, cve: str, target: str) -> dict:
         try:
             # read the saved PoC code from the file
             if os.path.exists(saved_path):
-                code = open(saved_path).read()
+                with open(saved_path, encoding="utf-8", errors="replace") as f:
+                    code = f.read()
                 method = methods_tried[0] if methods_tried else "LLM-generated"
                 vuln_type = ""
                 # try to extract vuln type from the CVE detail
@@ -830,8 +806,7 @@ async def run_poc(scan_id: str, cve: str, target: str) -> dict:
 
 
 # ---------------- self-improvement: reflect + learn ----------------
-
-async def run_self_reflect(target: str, findings: str, report: dict, scan_id: str) -> str:
+async def run_self_reflect(target: str, findings: str, scan_id: str) -> str:
     """After a scan completes, the AI reflects on what it learned and writes
     a 'lessons learned' entry to the knowledge base. This is read by future
     research runs to improve accuracy + speed."""
@@ -886,6 +861,8 @@ async def run_self_reflect(target: str, findings: str, report: dict, scan_id: st
 async def run_chat(scan_id: str, grounded: str, findings: str,
                    question: str, history: list[dict]) -> tuple[str, list[dict]]:
     sys = bp.build_chat_system(scan_id, grounded or "", findings or "")
+    # work on a copy — never mutate the caller's list (aliasing bug)
+    history = list(history or [])
     messages: list[dict] = [{"role": "system", "content": sys}]
     messages += history[-20:]
     messages.append({"role": "user", "content": question})

@@ -216,8 +216,13 @@ async def _playwright_fetch(url: str, max_chars: int = 10000) -> str:
 async def t_save_poc(scan_id: str, cve: str, code: str, filename: str = "") -> str:
     """Save a generated PoC script to disk + db (so chat agent can read it back). Returns path."""
     safe_cve = re.sub(r"[^A-Za-z0-9_-]", "_", cve or "vuln")
-    fname = filename or f"poc_{scan_id}_{safe_cve}.py"
-    path = config.POC / fname
+    # sanitize the LLM-supplied filename — strip dirs/separators so it can NEVER escape config.POC
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename or "")
+    safe_name = safe_name.lstrip(".").strip("/\\")
+    fname = safe_name or f"poc_{scan_id}_{safe_cve}.py"
+    path = (config.POC / fname).resolve()
+    if path.parent != config.POC.resolve():
+        path = config.POC / f"poc_{scan_id}_{safe_cve}.py"
     path.write_text(code, encoding="utf-8")
     try:
         from db import save_poc
@@ -327,7 +332,8 @@ async def t_run_poc_check(scan_id: str, cve: str, target: str) -> str:
     # ensure file exists (restore from db code if missing)
     if not os.path.exists(path) and r.get("code"):
         config.POC.mkdir(parents=True, exist_ok=True)
-        open(path, "w", encoding="utf-8").write(r["code"])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(r["code"])
     if not os.path.exists(path):
         return f"PoC file missing: {path}"
     try:
@@ -339,6 +345,12 @@ async def t_run_poc_check(scan_id: str, cve: str, target: str) -> str:
         return json.dumps({"returncode": proc.returncode, "output": out[:6000]},
                           ensure_ascii=False)
     except _aio.TimeoutError:
+        # kill the orphaned python3 process — otherwise it keeps hammering the target
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
         return json.dumps({"returncode": -1, "output": "TIMEOUT after 90s"}, ensure_ascii=False)
     except Exception as e:
         return f"ERR run: {type(e).__name__}: {e}"
@@ -385,9 +397,13 @@ async def dispatch(name: str, args: dict) -> str:
 
 
 async def close_all():
-    global _http
+    global _http, _scrapers
     if _http is not None:
         await _http.aclose(); _http = None
     if _scrapers is not None:
         for s in _scrapers:
-            await s.close()
+            try:
+                await s.close()
+            except Exception:
+                pass
+        _scrapers = None  # force rebuild — closed clients must not be reused

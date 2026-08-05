@@ -130,6 +130,12 @@ async def run_nuclei(cve: str, target: str, timeout: int = 60) -> dict:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
+        # kill the orphaned nuclei process tree — otherwise it keeps scanning
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
         return {"verdict": "ERROR", "output": "nuclei timeout", "found": False,
                 "template_path": tpl, "error": "timeout"}
     except FileNotFoundError:
@@ -198,8 +204,12 @@ def _parse_yaml_simple(yaml_text: str) -> dict:
     # raw HTTP requests
     raw_blocks = re.findall(r"- raw:\s*\n((?:\s{6,}.*\n?)+)", yaml_text)
     for block in raw_blocks:
-        req = "\n".join(line.strip() for line in block.strip().split("\n"))
-        info["requests"].append(req)
+        # strip the `- |` / `- >` block-scalar marker line and trailing blank lines
+        lines = [ln.strip() for ln in block.strip().split("\n")]
+        lines = [ln for ln in lines if ln and not re.match(r"^-\s*[|>][-+]?$", ln)]
+        if not lines:
+            continue
+        info["requests"].append("\n".join(lines))
     if not info["requests"]:
         # try method+path style
         method_blocks = re.findall(r"- method:\s*(\w+)\s*\n\s*path:\s*(.+)", yaml_text)
@@ -242,11 +252,11 @@ def get_template_code(cve: str) -> Optional[str]:
         if not lines:
             continue
         first = lines[0].strip()
+        # skip malformed captures (e.g. a lone `- |` marker that slipped past the parser)
+        if not re.match(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+", first, re.I):
+            continue
         parts = first.split()
-        if len(parts) >= 2:
-            method, path = parts[0], parts[1]
-        else:
-            method, path = "GET", "/"
+        method, path = parts[0], parts[1]
         # collect headers
         headers = {}
         body = ""
@@ -264,17 +274,27 @@ def get_template_code(cve: str) -> Optional[str]:
                 headers[k.strip()] = v.strip()
             elif not in_headers:
                 body += line
-        # replace {{Hostname}} in path
+        # replace nuclei template vars in path — random values for probes, drop interaction hosts
+        import random as _r, string as _s
+        path = re.sub(r"\{\{randstr:(\d+)\}\}", lambda m: "".join(_r.choices(_s.ascii_letters, k=int(m.group(1)))), path)
+        path = re.sub(r"\{\{rand1\}\}|\{\{rand2\}\}|\{\{randstr\}\}", lambda m: "".join(_r.choices(_s.ascii_letters, k=8)), path)
+        path = re.sub(r"\{\{hostName\}\}|\{\{interactsh-url\}\}|\{\{[^}]+\}\}", "", path)
         path = path.replace("{{Hostname}}", "")
         if not path.startswith("/"):
             path = "/" + path
+        # escape any stray braces so the generated f-string stays valid Python
+        path_f = path.replace("{", "{{").replace("}", "}}")
+        body_f = body.replace("{", "{{").replace("}", "}}")
+        req_var = f"r{i}"
+        last_var = req_var
         requests_code.append(
             f'    # Request {i+1}: {method} {path}\n'
-            f'    r{i} = s.request("{method}", target + "{path}", '
-            f'headers={headers!r}' + (f', data={body!r}' if body else '') + f', verify=False, timeout=10)\n'
-            f'    print(f"[{i+1}] {method} {path} -> HTTP {{r{i}.status_code}}")\n'
+            f'    {req_var} = s.request("{method}", target + "{path_f}", '
+            f'headers={headers!r}' + (f', data={body_f!r}' if body else '') + f', verify=False, timeout=10)\n'
+            f'    print(f"[{i+1}] {method} {path_f} -> HTTP {{r{i}.status_code}}")\n'
         )
-
+    if not requests_code:
+        return None
     matchers_code = ""
     if info["matchers"]:
         matchers_code = '    # Matchers from nuclei template: ' + "; ".join(info["matchers"][:3]) + "\n"
@@ -283,15 +303,15 @@ def get_template_code(cve: str) -> Optional[str]:
         if status_match:
             codes = status_match[0].split(":", 1)[1].strip()
             matchers_code += f'    expected = [{codes}]\n'
-            matchers_code += f'    if r0.status_code in expected and r0.status_code != 404:\n'
-            matchers_code += f'        print("[EXPLOITABLE] nuclei template matched (HTTP " + str(r0.status_code) + ")")\n'
+            matchers_code += f'    if {last_var}.status_code in expected and {last_var}.status_code != 404:\n'
+            matchers_code += f'        print("[EXPLOITABLE] nuclei template matched (HTTP " + str({last_var}.status_code) + ")")\n'
             matchers_code += f'        return\n'
         else:
-            matchers_code += f'    if r0.status_code == 200 and len(r0.text) > 0:\n'
-            matchers_code += f'        print("[EXPLOITABLE] nuclei template responded (HTTP 200, len=" + str(len(r0.text)) + ")")\n'
+            matchers_code += f'    if {last_var}.status_code == 200 and len({last_var}.text) > 0:\n'
+            matchers_code += f'        print("[EXPLOITABLE] nuclei template responded (HTTP 200, len=" + str(len({last_var}.text)) + ")")\n'
             matchers_code += f'        return\n'
     else:
-        matchers_code += f'    if r0.status_code == 200:\n'
+        matchers_code += f'    if {last_var}.status_code == 200:\n'
         matchers_code += f'        print("[EXPLOITABLE] target responded (HTTP 200)")\n'
         matchers_code += f'        return\n'
 
@@ -328,7 +348,7 @@ def main():
     print(f"[*] CVE: {cve} (nuclei template)")
 {"".join(requests_code)}
 {matchers_code}
-    print(f"[NOT EXPLOITABLE] nuclei template did not match (HTTP {{r0.status_code}}, patched or not vulnerable)")
+    print(f"[NOT EXPLOITABLE] nuclei template did not match (HTTP {{ {last_var}.status_code}}, patched or not vulnerable)")
 
 if __name__ == "__main__":
     main()

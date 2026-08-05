@@ -8,6 +8,7 @@ get(cve) returns the most *specific* post mentioning that CVE (writeup > weekly 
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Optional
 
@@ -144,14 +145,8 @@ class WordfenceScraper(BaseScraper):
         q = (query or "").lower()
         cve_m = _CVE_RE.search(query or "")
         cve = cve_m.group(0).upper() if cve_m else None
-        # if query IS a CVE → try threat-intel listing first (most complete)
         out: list[VulnRecord] = []
-        if cve:
-            for r in await self.fetch_recent(pages=5):
-                if r.cve == cve:
-                    out.append(r)
-                    break
-        # also check RSS blog feed for writeups
+        # RSS blog feed FIRST — fast (no Playwright). Covers writeups + weekly reports.
         items = await self._feed()
         matched = []
         for it in items:
@@ -174,6 +169,15 @@ class WordfenceScraper(BaseScraper):
                 published=None,
                 raw={"cves": sorted(cves), "type": "report" if it["is_report"] else "writeup"},
             ))
+        # only if the feed had no match, try ONE threat-intel page (not 5 — it's Playwright-slow)
+        if not out and cve:
+            try:
+                for r in await asyncio.wait_for(self.fetch_recent(pages=1), timeout=25):
+                    if r.cve == cve:
+                        out.append(r)
+                        break
+            except Exception:
+                pass
         return out
 
     async def get(self, cve_or_id: str) -> Optional[VulnRecord]:

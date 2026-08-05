@@ -29,8 +29,9 @@ from config import ALLOWED_USER_IDS
 
 log = logging.getLogger("vuln-monitor")
 
-_MONITOR_INTERVAL = 86400  # 24 hours
-_MAX_NEW_PER_CYCLE = 5   # max 5 new CVEs per hour (avoid spam)
+_MONITOR_INTERVAL = 21600  # 6 hours — realtime-ish, keeps the 14-day news window tight
+_MAX_NEW_PER_CYCLE = 5   # max 5 new CVEs per cycle (avoid spam)
+_RECENCY_DAYS = 14        # only surface CVEs published within the last 14 days
 
 # Feed sources — scrapers that return recent CVEs without needing a specific query
 # Covers ALL major web products: CMS, servers, languages, frameworks, panels
@@ -90,8 +91,13 @@ class VulnMonitor:
         # 1. Fetch latest CVEs from feed scrapers (parallel)
         new_cves = await self._fetch_feed_cves()
 
-        # 2. Filter out already-sent
-        new_cves = [c for c in new_cves if not await db.is_cve_sent(c["cve"])]
+        # 2. Filter out already-sent — ONE db call builds the sent set (avoids N sequential checks)
+        try:
+            sent_rows = await db.get_sent_cves(limit=5000)
+            sent_set = {r.get("cve", "").upper() for r in sent_rows}
+        except Exception:
+            sent_set = set()
+        new_cves = [c for c in new_cves if c["cve"].upper() not in sent_set]
         if not new_cves:
             log.info("monitor: no new CVEs this cycle")
             return
@@ -115,11 +121,28 @@ class VulnMonitor:
         from scrapers.registry import build_scrapers, search_all
         from scrapers.wordfence import WordfenceScraper
         import time as _time
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_RECENCY_DAYS)
         scrapers = build_scrapers()
-        current_year = str(_time.gmtime().tm_year)  # e.g. "2026"
-
         seen: set[str] = set()
         all_cves: list[dict] = []
+
+        def _recent(r) -> bool:
+            """True if the record's published date is within the recency window.
+            Records without a parseable date are kept (better a dup than a miss)."""
+            pub = (r.get("published") if isinstance(r, dict) else getattr(r, "published", None)) or ""
+            if not pub:
+                return True
+            try:
+                d = datetime.fromisoformat(str(pub).replace("Z", "+00:00"))
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=timezone.utc)  # naive source dates are UTC
+                return d >= cutoff
+            except ValueError:
+                return True
+        current_year = str(_time.gmtime().tm_year)  # keep as fallback context
+
+        # (seen/all_cves initialized above — no dup)
 
         # 1. PRIMARY: Wordfence threat-intel DB listing (all recent CVEs, year >= 2026)
         #    This catches CVEs that RSS misses (e.g. CVE-2026-5524 not in blog RSS feed)
@@ -127,7 +150,7 @@ class VulnMonitor:
             wf = WordfenceScraper()
             wf_recs = await wf.fetch_recent(pages=3)
             for r in wf_recs:
-                if r.cve and r.cve not in seen and f"-{current_year}-" in r.cve:
+                if r.cve and r.cve not in seen and _recent(r):
                     seen.add(r.cve)
                     all_cves.append({"cve": r.cve, "title": r.title, "severity": r.severity,
                                      "cvss": r.cvss, "source": r.source, "query": "wf-threat-intel"})
@@ -142,7 +165,8 @@ class VulnMonitor:
                 try:
                     recs = await search_all(scrapers, query)
                     return [{"cve": r.cve, "title": r.title, "severity": r.severity,
-                             "cvss": r.cvss, "source": r.source, "query": query}
+                             "cvss": r.cvss, "source": r.source, "query": query,
+                             "published": r.published}
                             for r in recs if r.cve]
                 except Exception:
                     return []
@@ -155,8 +179,8 @@ class VulnMonitor:
                 cve = cve_info["cve"]
                 if not cve or cve in seen:
                     continue
-                # only current year CVEs (e.g. CVE-2026-xxxxx)
-                if f"-{current_year}-" in cve:
+                # only CVEs published within the recency window
+                if _recent(cve_info):
                     seen.add(cve)
                     all_cves.append(cve_info)
 

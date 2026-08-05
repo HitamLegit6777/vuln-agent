@@ -37,9 +37,9 @@ class StackRecord:
 
 _WP_PLUGIN_RE = re.compile(r'wp-content/plugins/([a-z0-9_\-]+)', re.I)
 _WP_THEME_RE = re.compile(r'wp-content/themes/([a-z0-9_\-]+)', re.I)
-_WP_VER_RE = re.compile(r'WordPress\s+([0-9][0-9.\-]+)', re.I)
-_README_STABLE = re.compile(r'Stable tag:\s*([0-9][0-9.\-x]+)', re.I)
-_THEME_VER = re.compile(r'Version:\s*([0-9][0-9.\-]+)', re.I)
+_WP_VER_RE = re.compile(r'WordPress\s+([0-9][0-9.]*(?:-[0-9A-Za-z]+)?)', re.I)
+_README_STABLE = re.compile(r'Stable tag:\s*([0-9][0-9.]*(?:-[0-9A-Za-z]+)?)', re.I)
+_THEME_VER = re.compile(r'Version:\s*([0-9][0-9.]*(?:-[0-9A-Za-z]+)?)', re.I)
 
 
 def _identify_cms(p: ProbeResult, learned_sigs: list = None) -> tuple[Optional[str], Optional[str], list[str]]:
@@ -211,16 +211,17 @@ def _identify_cms(p: ProbeResult, learned_sigs: list = None) -> tuple[Optional[s
         return "oscommerce", (m.group(1) if m else None), ev_s
 
     # WHMCS
-    if "whmcs" in p.headers.get("x-powered-by", "").lower() or ("whmcs" in body.lower() and "/whmcs/" in body):
+    if "whmcs" in p.headers.get("x-powered-by", "").lower() or "/whmcs/" in body.lower():
         return "whmcs", None, [f"X-Powered-By: {p.headers.get('x-powered-by', '')}"]
 
     # Nextcloud
     if "nextcloud" in p.headers.get("x-powered-by", "").lower() or "/ocs/" in body:
         ver = None
-        m = re.search(r'Nextcloud\s*([0-9][0-9.]+)', p.headers.get("x-powered-by", ""), re.I)
+        xpb = p.headers.get("x-powered-by", "") or ""
+        m = re.search(r'Nextcloud\s*([0-9][0-9.]+)', xpb, re.I)
         if m:
             ver = m.group(1)
-        return "nextcloud", ver, [f"X-Powered-By: {p.headers['x-powered-by']}"]
+        return "nextcloud", ver, [f"X-Powered-By: {xpb}"]
 
     # Umbraco
     if "umbraco" in gen.lower() or "/umbraco/" in body:
@@ -383,7 +384,7 @@ async def detect_stack(url: str, client=None, learned_sigs: list = None) -> Stac
         return rec
     rec.services = _services(p)
     # WAF/CDN detection (from the same probe response — no extra request)
-    rec.waf = detect_waf(p.headers, p.body, p.status)
+    rec.waf = detect_waf(p.headers, p.body, p.status, cookies=p.cookies)
     if rec.waf:
         waf_names = waf_summary(rec.waf)
         rec.notes.append(f"WAF/CDN detected: {waf_names}")

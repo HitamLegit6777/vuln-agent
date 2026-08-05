@@ -60,6 +60,14 @@ class VulnRecord:
         d = asdict(self)
         d["affected"] = [asdict(a) for a in self.affected]
         return d
+    @staticmethod
+    def from_dict(d: Optional[dict]) -> Optional["VulnRecord"]:
+        """Rebuild from to_dict() output (for cache round-trips)."""
+        if not d:
+            return None
+        d = dict(d)
+        d["affected"] = [AffectedRange(**a) for a in (d.get("affected") or [])]
+        return VulnRecord(**d)
 
     def to_ai_context(self) -> str:
         """Grounded, AI-ready text block: description + ranges + PoC + patch + refs.
