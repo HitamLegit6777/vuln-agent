@@ -344,8 +344,9 @@ async def t_run_poc_check(scan_id: str, cve: str, target: str) -> str:
         out = (stdout.decode(errors="replace") or "") + "\n[stderr]\n" + (stderr.decode(errors="replace") or "")
         return json.dumps({"returncode": proc.returncode, "output": out[:6000]},
                           ensure_ascii=False)
-    except _aio.TimeoutError:
-        # kill the orphaned python3 process — otherwise it keeps hammering the target
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # kill the orphaned python3 process — a cancel from an outer wait_for (e.g.
+        # verify's 600s cap) would otherwise leave it hammering the target forever
         try:
             proc.kill()
             await proc.wait()

@@ -7,6 +7,7 @@ Anti-mismatch: each VulnRecord keeps its source/url; agent never merges ranges b
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional
 
 import httpx
@@ -107,6 +108,8 @@ def _dedupe(records: list[VulnRecord]) -> list[VulnRecord]:
 
 _PER_SOURCE_TIMEOUT = 30.0  # one hung scraper (e.g. Cloudflare-challenged page) must not stall the aggregate
 
+_in_flight: dict[str, asyncio.Future] = {}  # single-flight: one scrape per key at a time
+
 
 async def _aggregate(scrappers: list[BaseScraper], query: str, version, is_get: bool) -> list[VulnRecord]:
     """Shared get_all/search_all body with aggregate-level caching.
@@ -114,33 +117,56 @@ async def _aggregate(scrappers: list[BaseScraper], query: str, version, is_get: 
     cache) so a repeat CVE lookup during bot uptime never re-scrapes every source."""
     cache_get = next((s._cache_get for s in scrappers if s._cache_get), None)
     cache_set = next((s._cache_set for s in scrappers if s._cache_set), None)
-    key = f"agg:{'get' if is_get else 'search'}:{query}:{version or ''}"
+    # normalize the key — get(CVE) case/space variants, search(q, None/""/version) variants
+    if is_get:
+        q_norm = re.sub(r"\s+", "", str(query or "")).upper()
+        key = f"agg:get:{q_norm}"
+    else:
+        q_norm = re.sub(r"\s+", " ", str(query or "")).strip().lower()
+        key = f"agg:search:{q_norm}:{str(version or '').strip()}"
     if cache_get:
         try:
             hit = await cache_get(key)
-            if hit:
+            if hit is not None:
                 return [VulnRecord.from_dict(d) for d in hit if isinstance(d, dict)]
         except Exception:
             pass
 
-    async def _one(s: BaseScraper):
+    # single-flight: if another coroutine is already scraping this key, await its result
+    existing = _in_flight.get(key)
+    if existing is not None:
         try:
-            if is_get:
-                r = await asyncio.wait_for(s.get(query), timeout=_PER_SOURCE_TIMEOUT)
-                return [r] if r else []
-            return await asyncio.wait_for(s.search(query, version), timeout=_PER_SOURCE_TIMEOUT)
+            return await asyncio.shield(existing)
         except Exception:
-            return []
+            pass  # the other scrape failed — fall through and re-scrape
 
-    results = await asyncio.gather(*[_one(s) for s in scrappers], return_exceptions=True)
-    flat = [r for sub in results for r in (sub or [])]
-    recs = _dedupe(flat)
-    if cache_set and recs:
-        try:
-            await cache_set(key, [r.to_dict() for r in recs])
-        except Exception:
-            pass
-    return recs
+    async def _scrape():
+        async def _one(s: BaseScraper):
+            try:
+                if is_get:
+                    r = await asyncio.wait_for(s.get(query), timeout=_PER_SOURCE_TIMEOUT)
+                    return [r] if r else []
+                return await asyncio.wait_for(s.search(query, version), timeout=_PER_SOURCE_TIMEOUT)
+            except Exception:
+                return []
+        results = await asyncio.gather(*[_one(s) for s in scrappers], return_exceptions=True)
+        flat = [r for sub in results for r in (sub or [])]
+        recs = _dedupe(flat)
+        # cache_set is OUTSIDE the per-source timeouts — never loses just-fetched data.
+        # Empty results are cached too (negative caching) so unknown CVEs don't re-scrape.
+        if cache_set:
+            try:
+                await cache_set(key, [r.to_dict() for r in recs])
+            except Exception:
+                pass
+        return recs
+
+    fut = asyncio.ensure_future(_scrape())
+    _in_flight[key] = fut
+    try:
+        return await fut
+    finally:
+        _in_flight.pop(key, None)
 
 
 async def search_all(scrappers: list[BaseScraper], query: str,

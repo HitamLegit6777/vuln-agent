@@ -24,7 +24,9 @@ class CisaKevScraper(BaseScraper):
     async def _load(self) -> dict:
         if self._cache and (time.time() - self._ts) < _TTL:
             return self._cache
-        data = await self._get_json(KEV_URL)
+        # persist via the pluggable cache so every research run doesn't re-download
+        # the full KEV JSON (1.5MB) — in-memory TTL only helped within one process
+        data = await self._cached("cisa_kev:feed", lambda: self._get_json(KEV_URL))
         if data and data.get("vulnerabilities"):
             self._cache = data
             self._ts = time.time()

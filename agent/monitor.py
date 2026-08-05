@@ -55,6 +55,7 @@ class VulnMonitor:
         self.bot = bot
         self.admin_id = ALLOWED_USER_IDS[0] if ALLOWED_USER_IDS else None
         self._running = False
+        self._cycle_running = False
         self._task = None
 
     async def start(self):
@@ -83,7 +84,20 @@ class VulnMonitor:
             await asyncio.sleep(_MONITOR_INTERVAL)
 
     async def _check_cycle(self):
-        """One monitoring cycle: fetch feeds → filter new → analyze → send."""
+        """One monitoring cycle: fetch feeds → filter new → analyze → send.
+        Re-entrancy guard: the scheduled loop and a manual /monitor check must
+        never run two cycles concurrently (both would snapshot the sent-set,
+        both send, and double-send)."""
+        if self._cycle_running:
+            log.info("monitor: cycle already running — skipping concurrent call")
+            return
+        self._cycle_running = True
+        try:
+            await self._check_cycle_locked()
+        finally:
+            self._cycle_running = False
+
+    async def _check_cycle_locked(self):
         if not self.admin_id or not self.bot:
             return
 
@@ -143,20 +157,26 @@ class VulnMonitor:
         current_year = str(_time.gmtime().tm_year)  # keep as fallback context
 
         # (seen/all_cves initialized above — no dup)
-
-        # 1. PRIMARY: Wordfence threat-intel DB listing (all recent CVEs, year >= 2026)
-        #    This catches CVEs that RSS misses (e.g. CVE-2026-5524 not in blog RSS feed)
+        wf = None
         try:
+            # 1. PRIMARY: Wordfence threat-intel DB listing (all recent CVEs)
             wf = WordfenceScraper()
             wf_recs = await wf.fetch_recent(pages=3)
             for r in wf_recs:
                 if r.cve and r.cve not in seen and _recent(r):
                     seen.add(r.cve)
                     all_cves.append({"cve": r.cve, "title": r.title, "severity": r.severity,
-                                     "cvss": r.cvss, "source": r.source, "query": "wf-threat-intel"})
+                                     "cvss": r.cvss, "source": r.source, "query": "wf-threat-intel",
+                                     "published": r.published})
             log.info("monitor: wordfence threat-intel → %d CVEs", len(wf_recs))
         except Exception as e:
             log.error("monitor: wordfence fetch_recent error: %s", e)
+        finally:
+            if wf is not None:
+                try:
+                    await wf.close()
+                except Exception:
+                    pass
 
         # 2. SECONDARY: parallel search across product terms (semaphore 2 — keep event loop responsive)
         _search_sem = asyncio.Semaphore(2)
@@ -184,6 +204,13 @@ class VulnMonitor:
                     seen.add(cve)
                     all_cves.append(cve_info)
 
+        # close the per-cycle scraper pool — fresh build_scrapers() per cycle leaks
+        # ~15 httpx client pools otherwise
+        for s in scrapers:
+            try:
+                await s.close()
+            except Exception:
+                pass
         # sort by CVSS (highest first)
         all_cves.sort(key=lambda x: -(x.get("cvss") or 0))
         return all_cves
@@ -240,6 +267,7 @@ class VulnMonitor:
 
         # d. format + send Telegram report
         report = self._format_report(cve, cve_info, analysis, poc_status, poc_path, detail)
+        delivered = False
         if self.bot and self.admin_id:
             from telegram.constants import ParseMode
             # split if too long
@@ -248,15 +276,20 @@ class VulnMonitor:
                     await self.bot.send_message(
                         self.admin_id, chunk, parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True)
+                    delivered = True
                 except Exception as e:
                     log.error("monitor: send error: %s", e)
 
-        # e. mark as sent
-        await db.mark_cve_sent(
-            cve, analysis.get("summary", ""), cve_info.get("severity", ""),
-            cve_info.get("cvss", 0), analysis.get("rce_type", ""),
-            analysis.get("auth_type", ""), analysis.get("affects", ""),
-            poc_status, analysis.get("dorks", {}))
+        # e. mark as sent ONLY if at least one chunk was delivered — otherwise the
+        #    CVE stays unsent and is retried next cycle instead of being lost forever
+        if delivered:
+            await db.mark_cve_sent(
+                cve, analysis.get("summary", ""), cve_info.get("severity", ""),
+                cve_info.get("cvss", 0), analysis.get("rce_type", ""),
+                analysis.get("auth_type", ""), analysis.get("affects", ""),
+                poc_status, analysis.get("dorks", {}))
+        else:
+            log.warning("monitor: %s not marked sent — no chunk delivered", cve)
 
     async def _ai_analyze(self, cve: str, detail: str, cve_info: dict) -> dict:
         """AI analysis: summary, RCE chain, auth type, dorks. 1 LLM call.

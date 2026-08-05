@@ -37,6 +37,9 @@ def _init():
           key TEXT PRIMARY KEY, value TEXT, ts REAL
         );
         CREATE INDEX IF NOT EXISTS idx_scans_user ON scans(user_id);
+        CREATE TABLE IF NOT EXISTS settings(
+          key TEXT PRIMARY KEY, value TEXT
+        );
         """)
 
 
@@ -257,6 +260,28 @@ async def cache_set(key, value):
     async with _lock:
         await asyncio.to_thread(_cache_set_sync, key, value)
 
+
+
+# ---- runtime settings (e.g. active LLM models chosen via /model) ----
+def _get_setting(key, default=""):
+    with _conn() as c:
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
+
+
+def _set_setting(key, value):
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+
+async def get_setting(key, default=""):
+    async with _lock:
+        return await asyncio.to_thread(_get_setting, key, default)
+
+
+async def set_setting(key, value):
+    async with _lock:
+        await asyncio.to_thread(_set_setting, key, value)
 
 # ============ SELF-IMPROVEMENT: PoC Pattern Learning ============
 

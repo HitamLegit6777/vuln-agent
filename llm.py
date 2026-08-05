@@ -12,7 +12,57 @@ import httpx
 
 from config import ROUTER_BASE, ROUTER_KEY, LLM_TIMEOUT, MODEL_DETECT, MODEL_REPORT
 
+# runtime model overrides — set via bot /model command, persisted in db settings.
+# Fall back to config values when never switched.
+_detect_model: Optional[str] = None
+_report_model: Optional[str] = None
+
 _client: Optional[httpx.AsyncClient] = None
+
+
+def _detect() -> str:
+    return _detect_model or MODEL_DETECT
+
+
+def _report() -> str:
+    return _report_model or MODEL_REPORT
+
+
+def get_models() -> dict:
+    return {"detect": _detect(), "report": _report()}
+
+
+def set_models(detect: Optional[str] = None, report: Optional[str] = None) -> None:
+    """Override active models at runtime (persist separately via db).
+    Pass None to keep current, '' to reset to config default."""
+    global _detect_model, _report_model
+    if detect is not None:
+        _detect_model = detect or None
+    if report is not None:
+        _report_model = report or None
+
+
+async def load_models_from_db():
+    """Restore persisted model choices at startup."""
+    try:
+        import db as _db
+        d = await _db.get_setting("model_detect", "")
+        r = await _db.get_setting("model_report", "")
+        set_models(d or None, r or None)
+    except Exception:
+        pass
+
+
+async def fetch_available_models() -> list[str]:
+    """Query the router for available model ids (used by /model command)."""
+    try:
+        r = await _client_obj().get("/models", timeout=30.0)
+        if r.status_code >= 400:
+            return []
+        data = r.json()
+        return [m.get("id", "") for m in (data.get("data") or []) if m.get("id")]
+    except Exception:
+        return []
 
 
 def _client_obj() -> httpx.AsyncClient:
@@ -37,6 +87,8 @@ async def chat_stream(model: str, messages: list[dict], temperature: float = 0.2
     payload = {
         "model": model, "messages": messages, "temperature": temperature,
         "max_tokens": max_tokens, "stream": True,
+        # some 9router upstreams (deepseek-v4-flash) 400 without stream_options
+        "stream_options": {"include_usage": True},
     }
     parts: list[str] = []
     reasoning: list[str] = []
@@ -113,11 +165,11 @@ async def chat(model: str, messages: list[dict], temperature: float = 0.2,
 
 
 async def chat_detect(messages, temperature=0.15, max_tokens=4096) -> str:
-    return await chat_stream(MODEL_DETECT, messages, temperature, max_tokens, timeout=600)
+    return await chat_stream(_detect(), messages, temperature, max_tokens, timeout=600)
 
 
 async def chat_report(messages, temperature=0.2, max_tokens=8192) -> str:
-    return await chat_stream(MODEL_REPORT, messages, temperature, max_tokens, timeout=900)
+    return await chat_stream(_report(), messages, temperature, max_tokens, timeout=900)
 
 
 async def close():

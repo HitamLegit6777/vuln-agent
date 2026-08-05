@@ -214,7 +214,8 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
     # rank: VULNERABLE first, then cvss desc; cap the detail-fetch set so pre-research
     # doesn't do hundreds of full get_all() calls (each is 14 sources × network)
     _ranked = sorted(precomputed_vulns.values(),
-                     key=lambda v: (0 if v["label"] == "VULNERABLE" else 1, -(v.get("cvss") or 0)))
+                     key=lambda v: (0 if v["label"] == "VULNERABLE" else 1,
+                                    -(float(v.get("cvss") or 0))))  # LLM findings may carry str cvss
     cves_to_fetch = [v["cve"] for v in _ranked[:_PRE_FETCH_CAP]]
 
     if progress:
@@ -332,7 +333,8 @@ async def run_research(target: str,
     # fallback: build from pre-research + accumulated data (acc was pre-populated
     # from stack_data above; the AI-review loop fills acc["vulns"] when it emits findings).
     vulns = sorted(acc["vulns"].values(),
-                   key=lambda v: (0 if v["label"] == "VULNERABLE" else 1, -(v.get("cvss") or 0)))
+                   key=lambda v: (0 if v["label"] == "VULNERABLE" else 1,
+                                  -(float(v.get("cvss") or 0))))
     fallback = {"target": target, "stack": acc["stack"], "vulnerabilities": _filter_vulns(vulns),
                 "exploited_in_wild": [], "summary": "research auto-finalized (pre-research + AI review)",
                 "waf": acc.get("waf", []),
@@ -343,7 +345,6 @@ async def run_research(target: str,
 
 # ---------------- phase 2: report (deepseek-v4-pro) ----------------
 
-_VERIFY_CAP = 100  # effectively no cap — verify ALL VULNERABLE candidates (accuracy > speed)
 
 
 async def _enrich_epss(cands: list) -> None:
@@ -353,6 +354,7 @@ async def _enrich_epss(cands: list) -> None:
     cves = [str(v.get("cve")).upper() for v in cands if v.get("cve")]
     if not cves:
         return
+    scraper = None
     try:
         from scrapers.epss import EPSSScraper
         try:
@@ -361,9 +363,14 @@ async def _enrich_epss(cands: list) -> None:
         except Exception:
             scraper = EPSSScraper()
         scores = await scraper._fetch(cves)
-        await scraper.close()
     except Exception:
         return
+    finally:
+        if scraper is not None:
+            try:
+                await scraper.close()
+            except Exception:
+                pass
     for v in cands:
         info = scores.get(str(v.get("cve")).upper())
         if info and info.get("epss") is not None:
@@ -379,6 +386,7 @@ async def _enrich_kev(cands: list) -> set:
     cves = {str(v.get("cve")).upper() for v in cands if v.get("cve")}
     if not cves:
         return set()
+    scraper = None
     try:
         from scrapers.cisa_kev import CisaKevScraper
         try:
@@ -387,9 +395,14 @@ async def _enrich_kev(cands: list) -> set:
         except Exception:
             scraper = CisaKevScraper()
         data = await scraper._load()
-        await scraper.close()
     except Exception:
         return set()
+    finally:
+        if scraper is not None:
+            try:
+                await scraper.close()
+            except Exception:
+                pass
     catalog = {str(v.get("cveID", "")).upper()
                for v in (data.get("vulnerabilities") or [])}
     matched = cves & catalog
@@ -411,7 +424,7 @@ async def run_verify(findings_str: str, scan_id: str, target: str,
     cands = [v for v in f.get("vulnerabilities", []) if v.get("cve")
              and str(v.get("label", "")).upper().replace("-", "_") != "NOT_AFFECTED"]
     cands.sort(key=lambda v: (0 if str(v.get("label")).upper() == "VULNERABLE" else 1,
-                              -(v.get("cvss") or 0)))
+                              -(float(v.get("cvss") or 0))))
 
     # ENRICH: batch-fetch real EPSS (exploit probability) for all candidates in one call,
     # so risk scoring in run_report is grounded. Degrades silently if FIRST.org unreachable.

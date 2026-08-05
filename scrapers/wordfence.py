@@ -39,22 +39,31 @@ def _sev(cvss: Optional[float]) -> Optional[str]:
 class WordfenceScraper(BaseScraper):
     name = "wordfence"
 
-    async def _playwright_html(self, url: str) -> str:
+    async def _playwright_html(self, url: str, timeout: float = 45.0) -> str:
         """Fetch rendered HTML via headless Chromium (bypasses Cloudflare JS challenge).
-        Runs in a thread to avoid blocking the asyncio event loop."""
+        Bounded by wait_for + browser.close() in finally (no Chromium leak on failure)."""
         import asyncio
         def _sync():
             from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(url, wait_until="networkidle", timeout=30000)
-                import time
-                time.sleep(3)  # wait for CF challenge to resolve
-                html = page.content()
-                browser.close()
-                return html
-        return await asyncio.to_thread(_sync)
+            browser = None
+            try:
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    page.goto(url, wait_until="networkidle", timeout=30000)
+                    import time
+                    time.sleep(3)  # wait for CF challenge to resolve
+                    return page.content()
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_sync), timeout=timeout)
+        except asyncio.TimeoutError:
+            return ""
 
     async def fetch_recent(self, pages: int = 3) -> list[VulnRecord]:
         """Scrape Wordfence threat-intel vulnerabilities listing via cloak browser.

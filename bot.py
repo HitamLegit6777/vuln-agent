@@ -110,6 +110,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<code>/sources</code> — list vuln DB sources\n"
         "<code>/feedback &lt;scan_id&gt; good|bad|wrong</code> — rate a scan (self-improvement)\n"
         "<code>/knowledge</code> — liat knowledge yg bot udah pelajarin\n"
+        "<code>/model [detect|report &lt;id&gt;|list|reset]</code> — switch AI model\n"
         "<code>/monitor on|off|list|check</code> — vuln monitor (hourly new CVE alerts)")
 
 
@@ -120,9 +121,11 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.effective_message.reply_html("Usage: <code>/scan &lt;url&gt;</code>")
     target = ctx.args[0]
     user_id = update.effective_user.id
-    # cap concurrent jobs per user
-    user_jobs = _active_jobs.setdefault(user_id, {})
+    # cap concurrent jobs per user — prune BEFORE setdefault (BUG 3: setdefault-then-
+    # prune orphans a fresh user's dict) and reserve the slot BEFORE any await
+    # (BUG 2: TOCTOU — two concurrent /scan could both pass the cap check)
     _prune_active_jobs()
+    user_jobs = _active_jobs.setdefault(user_id, {})
     active = [sid for sid, j in user_jobs.items() if not j.get("done")]
     if len(active) >= _MAX_JOBS_PER_USER:
         return await update.effective_message.reply_html(
@@ -130,11 +133,12 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"atau lihat</i> <code>/jobs</code><i>.</i>")
     scan_id = runner.new_scan_id()
     started = time.strftime("%H:%M:%S")
+    # reserve the slot synchronously (no await between check and write)
+    user_jobs[scan_id] = {"target": target, "started": started, "done": False}
     msg = await update.effective_message.reply_html(
         f"<i>Scan dimulai (background)</i> <code>{_e(target)}</code>\n"
         f"Scan ID: <code>{scan_id}</code>\n"
         f"<i>Bot tetap bisa dipakai selama scan. Liat</i> <code>/jobs</code>")
-    user_jobs[scan_id] = {"target": target, "started": started, "done": False}
     # persist to DB (survive restart)
     try:
         await db.save_job(scan_id, user_id, target, started, "running")
@@ -187,6 +191,14 @@ async def _run_scan_bg(update: Update, bot, user_id: int, target: str, scan_id: 
             else:
                 await bot.send_message(user_id, ch, parse_mode=ParseMode.HTML,
                                        disable_web_page_preview=True)
+        # mark the job done — WITHOUT this the cap permanently blocks the user after
+        # 3 finished scans, /jobs shows everything as running, and memory grows unbounded
+        _active_jobs.setdefault(user_id, {}).setdefault(scan_id, {})["done"] = True
+        _prune_active_jobs()
+        try:
+            await db.update_job(scan_id, "done")
+        except Exception:
+            pass
     except Exception as e:
         log.exception("scan bg failed")
         kind = type(e).__name__
@@ -247,8 +259,9 @@ async def cmd_poc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.effective_message.reply_document(
                     document=f, filename=fp.split("/")[-1], caption=f"PoC for {cve} (cached)")
             return
-        # generate via agent loop (write -> run --check -> iterate)
-        result = await runner.run_poc(scan_id, cve, target)
+        # generate via agent loop (write -> run --check -> iterate) — bounded:
+        # the LLM loop is 30 steps × 900s; without a cap an adhoc /poc could run hours
+        result = await asyncio.wait_for(runner.run_poc(scan_id, cve, target), timeout=900)
         fp = result.get("path", "")
         verdict = result.get("verdict", "UNKNOWN")
         reason = result.get("reason", "")
@@ -450,17 +463,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _do_chat(update, scan_id, update.effective_message.text)
 
 
+_chat_locks: dict[int, asyncio.Lock] = {}  # per-user chat serialization (lost-update guard)
+
+
 async def _do_chat(update: Update, scan_id: str, question: str):
     row = await db.get_scan(scan_id)
     if not row:
         return await update.effective_message.reply_text("Scan ID tidak ditemukan.")
+    uid = update.effective_user.id
+    lock = _chat_locks.setdefault(uid, asyncio.Lock())
     msg = await update.effective_message.reply_html("<i>🤖 thinking…</i>")
     try:
-        history = await db.get_chat(scan_id)
-        answer, history = await runner.run_chat(
-            scan_id, "", row.get("findings") or "",
-            question, history)
-        await db.save_chat(scan_id, history)
+        # serialize get→run→save — two rapid messages must not overwrite each other's history
+        async with lock:
+            history = await db.get_chat(scan_id)
+            answer, history = await runner.run_chat(
+                scan_id, row.get("grounded") or "", row.get("findings") or "",
+                question, history)
+            await db.save_chat(scan_id, history)
         try:
             await msg.delete()
         except Exception:
@@ -479,28 +499,47 @@ async def _do_chat(update: Update, scan_id: str, question: str):
 
 
 def _split_html(text: str, limit: int = 3500) -> list[str]:
-    """Split long HTML for Telegram, never cutting mid-tag. If a chunk ends inside an
-    unclosed <b>/<i>/<code> tag, the opener is re-added at the front of the next chunk
-    (Telegram requires balanced tags per message)."""
+    """Split long HTML for Telegram, never cutting mid-tag and keeping every chunk
+    balanced. A stack tracks open tags: when a boundary lands inside a span, the
+    pushed chunk gets the closing tags appended and the next chunk is re-opened.
+    Falls back to a hard character split for single over-long paragraphs."""
+    _TAGS = ("b", "i", "code", "em", "strong", "u", "s", "pre", "a", "blockquote")
     if len(text) <= limit:
         return [text]
+
+    def _open_tags(s: str) -> list:
+        stack = []
+        for m in re.finditer(r"<(/?)(%s)[ >]" % "|".join(_TAGS), s, re.I):
+            closing, tag = m.group(1), m.group(2).lower()
+            if closing:
+                if stack and stack[-1] == tag:
+                    stack.pop()
+            else:
+                stack.append(tag)
+        return stack
+
     out, cur = [], ""
-    pending_open = ""
     for para in text.split("\n\n"):
-        if len(cur) + len(para) > limit:
-            if cur:
-                out.append(cur)
-            cur = pending_open + para if pending_open else para
-        else:
+        if not para:
+            continue
+        if len(cur) + len(para) + 2 <= limit:
             cur = (cur + "\n\n" + para) if cur else para
-        # track which simple tags are still open at the end of cur
-        opens = re.findall(r"<(b|i|code|em|strong)>", cur)
-        closes = re.findall(r"</(b|i|code|em|strong)>", cur)
-        pending = [t for t in opens if opens.count(t) > closes.count(t)]
-        pending_open = "".join(f"<{t}>" for t in dict.fromkeys(pending))
-        if pending_open and len(cur) + len(pending_open) > limit:
-            out.append(cur)
-            cur = pending_open
+            continue
+        # boundary — close open tags on the pushed chunk, reopen on the next
+        if cur:
+            open_now = _open_tags(cur)
+            out.append(cur + "".join(f"</{t}>" for t in reversed(open_now)))
+            cur = "".join(f"<{t}>" for t in open_now) + para
+        else:
+            # single paragraph larger than limit — hard split at a safe point
+            cur = para
+            while len(cur) > limit:
+                cut = cur.rfind(" ", 0, limit)
+                cut = cut if cut > 0 else limit
+                piece = cur[:cut]
+                open_now = _open_tags(piece)
+                out.append(piece + "".join(f"</{t}>" for t in reversed(open_now)))
+                cur = "".join(f"<{t}>" for t in open_now) + cur[cut:].lstrip()
     if cur:
         out.append(cur)
     return out
@@ -580,6 +619,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await cmd_scan(update, ctx)
     elif data == "history":
         await cmd_history(update, ctx)
+    elif data.startswith("model:"):
+        parts = data.split(":", 2)
+        if parts[1] == "reset":
+            from llm import set_models
+            set_models(detect="", report="")
+            await db.set_setting("model_detect", "")
+            await db.set_setting("model_report", "")
+            await q.message.reply_html("<b>Model reset ke default config.</b>")
+        elif len(parts) == 3:
+            from llm import set_models
+            role, model_id = parts[1], parts[2]
+            if role in ("detect", "report"):
+                set_models(**{role: model_id})
+                await db.set_setting(f"model_{role}", model_id)
+                await q.message.reply_html(
+                    f"<b>Model {role} →</b> <code>{_e(model_id)}</code>")
 
 
 def _e(s):
@@ -607,6 +662,64 @@ def _report_cves(report: dict) -> list:
     return out
 
 
+async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """View / switch the active LLM models (detect + report) from the provider."""
+    if not _gate(update):
+        return await _unauthorized(update)
+    from llm import get_models, set_models, fetch_available_models
+    cur = get_models()
+    args = [a for a in (ctx.args or [])]
+    if len(args) == 2 and args[0].lower() in ("detect", "report"):
+        role, model_id = args[0].lower(), args[1]
+        # validate against the provider list — a typo would silently break every LLM call
+        models = await fetch_available_models()
+        if models and model_id not in models:
+            return await update.effective_message.reply_html(
+                f"<b>Model tidak ditemukan di provider:</b> <code>{_e(model_id)}</code>\n"
+                f"<i>Gunakan</i> <code>/model list</code> <i>utk liat model yg tersedia.</i>")
+        if role == "detect":
+            set_models(detect=model_id)
+            await db.set_setting("model_detect", model_id)
+        else:
+            set_models(report=model_id)
+            await db.set_setting("model_report", model_id)
+        return await update.effective_message.reply_html(
+            f"<b>Model {role} →</b> <code>{_e(model_id)}</code>\n"
+            f"<i>Berlaku untuk scan berikutnya.</i>")
+    if len(args) == 1 and args[0].lower() in ("list", "reset"):
+        if args[0].lower() == "reset":
+            set_models(detect="", report="")
+            await db.set_setting("model_detect", "")
+            await db.set_setting("model_report", "")
+            return await update.effective_message.reply_html(
+                "<b>Model reset ke default config.</b>")
+        # list = fall through to full listing
+    # fetch provider models
+    models = await fetch_available_models()
+    if not models:
+        return await update.effective_message.reply_html(
+            "<b>Model saat ini:</b>\n"
+            f"detect: <code>{_e(cur['detect'])}</code>\n"
+            f"report: <code>{_e(cur['report'])}</code>\n\n"
+            "<i>Provider tidak merespon /models — coba lagi nanti.</i>")
+    # filter to relevant prefixes (al/* and common combos), cap display
+    short = [m for m in models if m.startswith(("al/", "co/"))][:40]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔍 detect: {_e(m)}", callback_data=f"model:detect:{m}")]
+        for m in short[:15]
+    ] + [
+        [InlineKeyboardButton(f"📝 report: {_e(m)}", callback_data=f"model:report:{m}")]
+        for m in short[15:30]
+    ] + [[InlineKeyboardButton("↩️ Reset default", callback_data="model:reset")]])
+    await update.effective_message.reply_html(
+        f"<b>Model aktif:</b>\n"
+        f"detect: <code>{_e(cur['detect'])}</code>\n"
+        f"report: <code>{_e(cur['report'])}</code>\n\n"
+        f"<i>Pilih model (dari provider, {len(short)} tampil):</i>\n"
+        f"<code>/model detect &lt;id&gt;</code> atau <code>/model report &lt;id&gt;</code>",
+        reply_markup=kb)
+
+
 def main():
     config.assert_configured()
     db.init_db()
@@ -616,9 +729,14 @@ def main():
         _aio.run(db.mark_all_interrupted())
     except Exception:
         pass
-    # start vuln monitor after bot is ready
+    # restore persisted model choices, then start vuln monitor
     async def _post_init(application):
         global _monitor
+        try:
+            from llm import load_models_from_db
+            await load_models_from_db()
+        except Exception:
+            pass
         _monitor = VulnMonitor(bot=application.bot)
         await _monitor.start()
 
@@ -633,7 +751,7 @@ def main():
     app.add_handler(CommandHandler("poc", cmd_poc))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("history", cmd_history))
-    app.add_handler(CommandHandler("sources", cmd_sources))
+    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
     app.add_handler(CommandHandler("knowledge", cmd_knowledge))
     app.add_handler(CommandHandler("monitor", cmd_monitor))
