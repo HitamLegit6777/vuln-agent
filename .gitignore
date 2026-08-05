@@ -7,3 +7,7 @@ poc/
 nuclei-templates/
 doman.txt
 data/edb.csv
+newshell.phtml
+magento.py
+poc_CVE-2026-11387.py
+poc_CVE-2026-5524.py
