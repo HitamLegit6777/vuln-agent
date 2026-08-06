@@ -83,3 +83,94 @@ def test_rank_findings_sorts_and_annotates():
 def test_rank_findings_handles_empty():
     assert scoring.rank_findings([]) == []
     assert scoring.rank_findings(None) == []
+
+
+# ---- verdict state machine (normalize_verdict) ----
+
+
+def test_normalize_legacy_not_exploitable_to_not_reproduced():
+    assert scoring.normalize_verdict("NOT EXPLOITABLE", "endpoint returned 403")[0] == "NOT_REPRODUCED"
+    assert scoring.normalize_verdict("NOT_EXPLOITABLE", "no direct proof")[0] == "NOT_REPRODUCED"
+
+
+def test_normalize_version_evidence_maps_to_not_applicable():
+    for reason in ("version not in range", "version patched", "not affected",
+                   "outside the affected range", "already fixed"):
+        v, _ = scoring.normalize_verdict("NOT EXPLOITABLE", reason)
+        assert v == "NOT_APPLICABLE", reason
+    # NOT_AFFECTED label itself maps to NOT_APPLICABLE
+    assert scoring.normalize_verdict("NOT_AFFECTED", "")[0] == "NOT_APPLICABLE"
+
+
+def test_normalize_timeout_and_error():
+    v, r = scoring.normalize_verdict("NOT EXPLOITABLE", "verify timeout (600s per candidate)",
+                                     timeout=True)
+    assert v == "INCONCLUSIVE" and r == "verify timeout (600s per candidate)"
+    v, _ = scoring.normalize_verdict("EXPLOITABLE", "verify err: boom", error=True)
+    assert v == "INCONCLUSIVE"
+
+
+def test_normalize_connectivity_error_maps_to_unreachable():
+    v, _ = scoring.normalize_verdict("", "verify err: Connection refused to target", error=True)
+    assert v == "UNREACHABLE"
+    v, _ = scoring.normalize_verdict("", "verify err: Name or service not known", error=True)
+    assert v == "UNREACHABLE"
+
+
+def test_normalize_exploitable_requires_direct_proof():
+    strong = "webshell uploaded, uid=33(www-data) reflected in response"
+    assert scoring.normalize_verdict("EXPLOITABLE", strong)[0] == "EXPLOITABLE"
+    # circumstantial / no proof -> downgrade to NOT_REPRODUCED with rewritten reason
+    v, r = scoring.normalize_verdict("EXPLOITABLE", "detected version in affected range, http 200")
+    assert v == "NOT_REPRODUCED"
+    assert "no direct exploitation proof" in r
+    v, r = scoring.normalize_verdict("EXPLOITABLE", "advisory says exploitable")
+    assert v == "NOT_REPRODUCED"
+
+
+def test_normalize_unknown_to_inconclusive():
+    assert scoring.normalize_verdict("", "")[0] == "INCONCLUSIVE"
+    assert scoring.normalize_verdict("UNKNOWN", "")[0] == "INCONCLUSIVE"
+    assert scoring.normalize_verdict("garbage", "")[0] == "INCONCLUSIVE"
+
+
+def test_normalize_is_deterministic():
+    inputs = [("NOT EXPLOITABLE", "version patched"), ("EXPLOITABLE", "uid=0 root"),
+              ("UNKNOWN", ""), ("INCONCLUSIVE", "verify timeout")]
+    assert len({scoring.normalize_verdict(v, r) for v, r in inputs}) == len(inputs)
+    # same input twice -> same output (no clock, no randomness)
+    assert (scoring.normalize_verdict("NOT EXPLOITABLE", "version patched")
+            == scoring.normalize_verdict("NOT EXPLOITABLE", "version patched"))
+
+
+# ---- confidence + coverage ----
+
+
+def test_confidence_deterministic_and_ordered():
+    c_expl = scoring.verdict_confidence("EXPLOITABLE")
+    c_na = scoring.verdict_confidence("NOT_APPLICABLE")
+    c_nr = scoring.verdict_confidence("NOT_REPRODUCED", attempts=3)
+    c_inc = scoring.verdict_confidence("INCONCLUSIVE")
+    c_unr = scoring.verdict_confidence("UNREACHABLE")
+    assert c_expl > c_na > c_nr > c_inc > c_unr
+    # attempts raise NOT_REPRODUCED confidence (tested run > nothing run)
+    assert scoring.verdict_confidence("NOT_REPRODUCED", attempts=2) > \
+        scoring.verdict_confidence("NOT_REPRODUCED", attempts=0)
+    assert scoring.verdict_confidence("EXPLOITABLE") == scoring.verdict_confidence("EXPLOITABLE")
+
+
+def test_report_coverage_fraction():
+    full = scoring.report_coverage(["EXPLOITABLE", "NOT_REPRODUCED", "NOT_APPLICABLE"])
+    assert full == {"total": 3, "definite": 3, "coverage": 1.0}
+    partial = scoring.report_coverage(["EXPLOITABLE", "INCONCLUSIVE", "NOT_REPRODUCED"])
+    assert partial["total"] == 3 and partial["definite"] == 2 and partial["coverage"] == round(2 / 3, 3)
+    none = scoring.report_coverage([])
+    assert none == {"total": 0, "definite": 0, "coverage": 0.0}
+
+
+def test_not_reproduced_demoted_in_score():
+    safe = scoring.score_finding({"cve": "A", "verified": "NOT_REPRODUCED", "cvss": 9.8})
+    unknown = scoring.score_finding({"cve": "B", "cvss": 9.8})
+    assert safe["risk"] < unknown["risk"]
+    na = scoring.score_finding({"cve": "C", "verified": "NOT_APPLICABLE", "cvss": 9.8})
+    assert na["risk"] < unknown["risk"]

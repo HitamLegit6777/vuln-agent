@@ -29,6 +29,24 @@ from config import ALLOWED_USER_IDS
 
 log = logging.getLogger("vuln-monitor")
 
+try:
+    import telegram_rich as _tr
+except Exception:  # sibling module absent — bootstrap shim keeps monitor alive
+    _tr = None
+
+
+async def _rich_send(bot, chat_id, text, **kw):
+    """Route a monitor alert through telegram_rich (rich path, legacy fallback
+    owned by the helper). Returns one result per chunk."""
+    if _tr is not None:
+        return await _tr.send_rich(bot, chat_id, text, **kw)
+    from telegram.constants import ParseMode
+    return [await getattr(bot, "send_message")(
+        chat_id, text, parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True, **kw)]
+
+
+
 _MONITOR_INTERVAL = 21600  # 6 hours — realtime-ish, keeps the 14-day news window tight
 _MAX_NEW_PER_CYCLE = 5   # max 5 new CVEs per cycle (avoid spam)
 _RECENCY_DAYS = 14        # only surface CVEs published within the last 14 days
@@ -299,20 +317,16 @@ class VulnMonitor:
         # library: record the processed analysis (summary/rce/auth/dorks) — fail-soft
         await self._lib_ingest(cve_info, analysis, detail)
 
-        # d. format + send Telegram report
+        # d. format + send Telegram report (rich path — telegram_rich owns
+        #    sanitize + chunk + legacy fallback)
         report = self._format_report(cve, cve_info, analysis, poc_status, poc_path, detail)
         delivered = False
         if self.bot and self.admin_id:
-            from telegram.constants import ParseMode
-            # split if too long
-            for i, chunk in enumerate(self._split_msg(report)):
-                try:
-                    await self.bot.send_message(
-                        self.admin_id, chunk, parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True)
-                    delivered = True
-                except Exception as e:
-                    log.error("monitor: send error: %s", e)
+            try:
+                results = await _rich_send(self.bot, self.admin_id, report)
+                delivered = bool(results)
+            except Exception as e:
+                log.error("monitor: send error: %s", e)
 
         # e. mark as sent ONLY if at least one chunk was delivered — otherwise the
         #    CVE stays unsent and is retried next cycle instead of being lost forever
@@ -471,53 +485,37 @@ CRITICAL RULES:
         if pm:
             patch_url = pm.group(1)
 
-        lines = [
-            f"🚨 <b>NEW VULN: {html.escape(cve)}</b>",
-            f"<b>Severity:</b> {sev}{cvss_str}",
+        parts = [
+            f"<h2>🚨 NEW VULN: {html.escape(cve)}</h2>",
+            f"<p><b>Severity:</b> {sev}{cvss_str}</p>",
         ]
         if pub_date:
-            lines.append(f"<b>Published:</b> {pub_date}{days_ago}")
-        lines += [
-            f"<b>Affected:</b> {html.escape(analysis.get('affects') or cve_info.get('title', '-'))[:200]}",
-            f"<b>Auth:</b> {html.escape(auth_type)}",
-            f"<b>RCE:</b> {rce_emoji} {html.escape(rce_type)}",
-            f"<b>Chain:</b> {html.escape(analysis.get('rce_chain', '-'))[:300]}",
-            "",
-            f"<b>Cara kerja:</b>",
-            html.escape(analysis.get("summary", "-"))[:1000],
-            "",
+            parts.append(f"<p><b>Published:</b> {pub_date}{days_ago}</p>")
+        parts += [
+            f"<p><b>Affected:</b> {html.escape(analysis.get('affects') or cve_info.get('title', '-'))[:200]}</p>",
+            f"<p><b>Auth:</b> {html.escape(auth_type)}</p>",
+            f"<p><b>RCE:</b> {rce_emoji} {html.escape(rce_type)}</p>",
+            f"<p><b>Chain:</b> {html.escape(analysis.get('rce_chain', '-'))[:300]}</p>",
+            "<h3>Cara kerja</h3>",
+            f"<p>{html.escape(analysis.get('summary', '-'))[:1000]}</p>",
         ]
 
         if shodan or fofa or hunter:
-            lines.append("<b>Dorks:</b>")
+            items = []
             if shodan:
-                lines.append(f'  <b>Shodan:</b> <code>{html.escape(shodan)}</code>')
+                items.append(f"<b>Shodan:</b> <code>{html.escape(shodan)}</code>")
             if fofa:
-                lines.append(f'  <b>FOFA:</b> <code>{html.escape(fofa)}</code>')
+                items.append(f"<b>FOFA:</b> <code>{html.escape(fofa)}</code>")
             if hunter:
-                lines.append(f'  <b>Hunter:</b> <code>{html.escape(hunter)}</code>')
-            lines.append("")
+                items.append(f"<b>Hunter:</b> <code>{html.escape(hunter)}</code>")
+            parts.append("<h3>Dorks</h3>\n<ul>\n"
+                         + "\n".join(f"<li>{i}</li>" for i in items)
+                         + "\n</ul>")
 
-        lines.append(f"<b>PoC:</b> {html.escape(poc_status)}")
+        parts.append(f"<p><b>PoC:</b> {html.escape(poc_status)}</p>")
         if patch_url:
-            lines.append(f'<b>Patch:</b> <a href="{html.escape(patch_url)}">diff</a>')
+            parts.append(f'<p><b>Patch:</b> <a href="{html.escape(patch_url)}">diff</a></p>')
 
-        lines.append("")
-        lines.append(f"<i>Gunakan</i> <code>/poc adhoc {cve}</code> <i>utk generate+test PoC.</i>")
+        parts.append(f"<p><i>Gunakan</i> <code>/poc adhoc {cve}</code> <i>utk generate+test PoC.</i></p>")
 
-        return "\n".join(lines)
-
-    def _split_msg(self, text: str, limit: int = 3500) -> list[str]:
-        if len(text) <= limit:
-            return [text]
-        out, cur = [], ""
-        for para in text.split("\n"):
-            if len(cur) + len(para) > limit:
-                if cur:
-                    out.append(cur)
-                cur = para
-            else:
-                cur = (cur + "\n" + para) if cur else para
-        if cur:
-            out.append(cur)
-        return out
+        return "\n".join(parts)

@@ -20,6 +20,11 @@ AI-powered vulnerability scanner + exploit-research assistant for Telegram.
 - **Switch AI models from Telegram** — `/model` lists provider models and swaps detect/report models at runtime (persisted).
 - **Multi-model cooperation** — a fast detect model (ReAct research) + a report/PoC model, both streamed with hard timeouts + retries.
 - **Private intelligence library** — canonical CVE/advisory facts with source provenance, conflict tracking, FTS5 + deterministic related search, per-target evidence/drift, notes/tags, JSONL import/export, integrity checks, backups, and continuous stale-record refresh.
+- **Durable concurrent jobs** — process-wide scan capacity, persisted stage checkpoints, immutable per-job model snapshots, cancellation, resume, retry, and graceful shutdown draining.
+- **Honest verdict state machine** — `EXPLOITABLE`, `NOT_REPRODUCED`, `NOT_APPLICABLE`, `INCONCLUSIVE`, and `UNREACHABLE`, with deterministic confidence and verification coverage. Timeouts and WAF blocks are never reported as clean.
+- **Adaptive source health** — per-source latency learning, timeout tuning, persisted circuit breakers, `Retry-After` handling, single-flight requests, and stale-cache fallback during upstream outages.
+- **Remediation workflow** — prioritized plans, scan-to-scan comparisons, and retests; exploit-strategy outcomes are persisted and reused by later PoC attempts.
+- **Modern Telegram rendering** — centralized rich-text sanitization, bounded chunking, tables/details, and a legacy fallback for unsupported clients.
 
 ---
 
@@ -102,6 +107,7 @@ cp .env.example .env   # then edit
 # Telegram bot
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF        # from @BotFather
 ALLOWED_USER_IDS=123456789,987654321     # who may use the bot
+ALLOW_PUBLIC_BOT=false                     # fail closed when allowlist is empty
 
 # LLM router (OpenAI-compatible). Any OpenAI-compatible endpoint works.
 ROUTER_BASE=https://9router.kliksosmed.id/v1
@@ -136,6 +142,9 @@ python3 bot.py
 |---|---|
 | `/scan <url>` | Background scan: detect stack → research → verify → report |
 | `/jobs` | List running / interrupted scans |
+| `/cancel <scan_id>` | Cancel an owned queued or running scan |
+| `/resume <scan_id>` | Continue an interrupted or failed scan from its checkpoint |
+| `/retry <scan_id> [research\|verify\|report]` | Restart an owned scan from a selected durable stage |
 | `/poc <scan_id> <CVE>` | Generate + verify a PoC for a CVE (`force` to regenerate) |
 | `/chat <scan_id> [question]` | Persistent Q&A about a scan (`/end` to exit) |
 | `/model [detect\|report <id>] [list\|reset]` | Switch AI models at runtime (from provider list) |
@@ -145,6 +154,9 @@ python3 bot.py
 | `/sources` | List vulnerability sources |
 | `/feedback <scan_id> good\|bad\|wrong [note]` | Rate a scan (feeds self-improvement) |
 | `/knowledge` | Show lessons learned from prior scans |
+| `/remediate <scan_id>` | Build a prioritized remediation plan from verified findings |
+| `/compare <older_scan_id> <newer_scan_id>` | Compare verdict drift between two owned scans |
+| `/retest <scan_id>` | Start a fresh retest of the same target and compare it to the baseline |
 
 | `/library stats` | Personal library counts, source coverage, conflicts, and stale records |
 | `/library search <query>` | Full-text search over canonical private facts |

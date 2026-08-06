@@ -77,10 +77,12 @@ def score_finding(finding: dict,
     if verified == "EXPLOITABLE":
         score += 60.0
         factors.append("verified exploitable on target (+60)")
-    elif verified in ("NOT EXPLOITABLE", "NOT_EXPLOITABLE"):
-        # proven safe on this target: keep it low regardless of intrinsic severity
+    elif verified in ("NOT EXPLOITABLE", "NOT_EXPLOITABLE", "NOT_REPRODUCED", "NOT_APPLICABLE"):
+        # proven safe / not applicable on this target: keep it low regardless of
+        # intrinsic severity (NOT_REPRODUCED/NOT_APPLICABLE are the canonical
+        # successors of the legacy NOT EXPLOITABLE verdict)
         score -= 25.0
-        factors.append("verified NOT exploitable on target (-25)")
+        factors.append("verified not exploitable on target (-25)")
 
     # --- in-the-wild / KEV ---
     if itw:
@@ -123,3 +125,155 @@ def rank_findings(findings: list[dict],
         res = score_finding(v, exploited_in_wild=cve_up in itw_set)
         v.update(res)
     return sorted(findings or [], key=lambda v: v.get("risk", 0.0), reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Verdict state machine — the single canonical mapping for exploitability
+# verdicts, confidence, and coverage. Pure and deterministic (no clock, no
+# randomness, no network), so reports, verify phase, and stored-data re-renders
+# all agree on what a verdict means.
+# ---------------------------------------------------------------------------
+
+# Canonical per-finding verdicts.
+VERDICTS = ("EXPLOITABLE", "NOT_REPRODUCED", "NOT_APPLICABLE", "INCONCLUSIVE", "UNREACHABLE")
+# Canonical report-level statuses (successors of the old binary EXPLOITABLE/CLEAN).
+REPORT_STATUSES = ("EXPLOITABLE", "NO_EXPLOIT_REPRODUCED", "INCONCLUSIVE", "UNREACHABLE")
+
+# Reasons that deterministically say the target version is outside the affected
+# range or already patched — a legacy NOT EXPLOITABLE with one of these maps to
+# NOT_APPLICABLE (the vuln does not apply to this target), not NOT_REPRODUCED.
+_NOT_APPLICABLE_PATTERNS = (
+    "not in the affected range", "not in affected range", "not in range",
+    "outside the affected range", "out of the affected range", "outside affected range",
+    "out of range", "version not affected", "version is not affected", "not affected",
+    "version patched", "already patched", "patched", "already fixed", "fixed in",
+    "fixed version", "not vulnerable", "not exploitable in this version",
+    "version out of range", "version not in",
+)
+
+# Connectivity-level failures that make the TARGET itself unreachable (as opposed
+# to the PoC merely not reproducing) — a verify error with one of these maps to
+# UNREACHABLE, anything else to INCONCLUSIVE.
+_UNREACHABLE_PATTERNS = (
+    "unreachable", "connection refused", "connection reset", "connection error",
+    "connection timed out", "getaddrinfo", "name or service not known",
+    "name resolution", "failed to resolve", "timed out resolving", "cannot connect",
+    "no route to host", "network is unreachable", "econnrefused", "econnreset",
+    "dns resolution", "max retries exceeded", "tunnel connection failed",
+)
+
+# Weak evidence patterns — if an EXPLOITABLE reason contains only these, the claim
+# is circumstantial (version in range / HTTP status / advisory text), so the verdict
+# downgrades to NOT_REPRODUCED: the exploit was NOT reproduced on this target.
+_WEAK_PATTERNS = [
+    "version in range", "version is within", "detected version", "affected range",
+    "http 200", "status 200", "returned 200", "http 302", "redirect",
+    "endpoint accessible", "endpoint returned", "returned http",
+    "advisory says", "cve advisory", "vulnerable version",
+    "empty data", "data:[]", "success\":true", "no authentication required",
+]
+
+# Direct proof patterns — an EXPLOITABLE reason containing any of these is genuine
+# exploitation evidence (output reflected, code executed, data exfiltrated, ...).
+_STRONG_PATTERNS = [
+    "reflected", "marker", "uid=", "gid=", "www-data", "root:x:0",
+    "command output", "echo ", "sleep confirmed", "delay measured",
+    "uploaded file", "file accessible", "webshell", "php executed",
+    "sql", "database", "query returned", "data exfil",
+    "admin dashboard", "authenticated content", "user list",
+    "privilege escalated", "group changed", "user created",
+    "api key", "credential", "secret", "config leaked",
+    "rce confirmed", "code execution", "payload executed",
+    "math result", "arithmetic", "3105",
+]
+
+
+def is_not_applicable_reason(reason: str) -> bool:
+    """Deterministic: does the reason say the target version is out of range / patched?"""
+    low = str(reason or "").lower()
+    return any(p in low for p in _NOT_APPLICABLE_PATTERNS)
+
+
+def is_unreachable_error(reason: str) -> bool:
+    """Deterministic: does the error say the TARGET itself could not be reached?"""
+    low = str(reason or "").lower()
+    return any(p in low for p in _UNREACHABLE_PATTERNS)
+
+
+def normalize_verdict(verdict, reason: str = "",
+                      *, timeout: bool = False, error: bool = False) -> tuple[str, str]:
+    """Map any raw/legacy verdict onto the canonical verdict set (deterministic).
+
+    * timeout/error flags (from the verify phase's wall-clock cap) -> INCONCLUSIVE;
+      an error whose text shows connectivity failure -> UNREACHABLE.
+    * EXPLOITABLE is kept only with DIRECT proof in the reason; weak/circumstantial
+      proof downgrades to NOT_REPRODUCED (exploit not reproduced on this target).
+    * legacy NOT EXPLOITABLE / NOT_EXPLOITABLE -> NOT_APPLICABLE when the reason
+      deterministically says version out of range / patched, else NOT_REPRODUCED.
+    * any unrecognized value (UNKNOWN, empty, ...) -> INCONCLUSIVE, so a missing
+      verdict can never be misread as "safe".
+
+    Returns (canonical_verdict, reason) — the reason is rewritten only on the
+    weak-proof downgrade, so the original evidence text survives everywhere else.
+    """
+    v = str(verdict or "").strip().upper().replace("-", "_").replace(" ", "_")
+    r = str(reason or "")
+    if timeout:
+        return "INCONCLUSIVE", r
+    if error:
+        return ("UNREACHABLE", r) if is_unreachable_error(r) else ("INCONCLUSIVE", r)
+    if v in ("EXPLOITABLE", "VERIFIED", "CONFIRMED"):
+        low = r.lower()
+        if any(p in low for p in _STRONG_PATTERNS):
+            return "EXPLOITABLE", r  # direct proof present — keep
+        if any(p in low for p in _WEAK_PATTERNS):
+            return "NOT_REPRODUCED", (
+                "Version in range but no direct exploitation proof. PoC claimed "
+                "EXPLOITABLE but reason only shows circumstantial evidence: " + r[:150])
+        return "NOT_REPRODUCED", f"No direct proof found in verify reason. {r[:150]}"
+    if v in ("NOT_EXPLOITABLE", "NOT_REPRODUCED", "NOT_EXPLOITED", "SAFE",
+             "PATCHED", "NOT_VERIFIED"):
+        if is_not_applicable_reason(r):
+            return "NOT_APPLICABLE", r
+        return "NOT_REPRODUCED", r
+    if v in ("NOT_AFFECTED", "NOT_APPLICABLE", "OUT_OF_RANGE", "NO_MATCH"):
+        return "NOT_APPLICABLE", r
+    if v in ("UNREACHABLE", "DOWN", "OFFLINE", "UNRESOLVED"):
+        return "UNREACHABLE", r
+    return "INCONCLUSIVE", r
+
+
+def verdict_confidence(verdict, attempts: int = 0, reason: str = "") -> float:
+    """Deterministic confidence (0..1) in a single finding's verdict.
+
+    EXPLOITABLE requires direct proof (0.95); NOT_REPRODUCED from an actual test run
+    is 0.8 (0.7 when nothing was run); NOT_APPLICABLE rests on version evidence (0.9);
+    INCONCLUSIVE/UNREACHABLE are knowingly low (0.35 / 0.1). Pure function of inputs.
+    """
+    v = str(verdict or "").upper()
+    if v == "EXPLOITABLE":
+        return 0.95
+    if v == "NOT_REPRODUCED":
+        return 0.8 if int(attempts or 0) > 0 else 0.7
+    if v == "NOT_APPLICABLE":
+        return 0.9
+    if v == "INCONCLUSIVE":
+        return 0.35
+    if v == "UNREACHABLE":
+        return 0.1
+    return 0.0
+
+
+_DEFINITE = frozenset(("EXPLOITABLE", "NOT_REPRODUCED", "NOT_APPLICABLE"))
+
+
+def report_coverage(verdicts) -> dict:
+    """Deterministic coverage of a scan's verified candidates: the fraction that
+    reached a DEFINITE outcome (exploitable / not reproduced / not applicable).
+    Timeouts/errors keep coverage below 1.0, so a partially-verified scan visibly
+    reports lower coverage instead of pretending full confidence."""
+    total = len(verdicts or [])
+    definite = sum(1 for v in (verdicts or [])
+                   if str(v or "").upper() in _DEFINITE)
+    return {"total": total, "definite": definite,
+            "coverage": round(definite / total, 3) if total else 0.0}

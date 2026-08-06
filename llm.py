@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from typing import Optional
+import contextvars
 
 import httpx
 
@@ -16,16 +17,30 @@ from config import ROUTER_BASE, ROUTER_KEY, LLM_TIMEOUT, MODEL_DETECT, MODEL_REP
 # Fall back to config values when never switched.
 _detect_model: Optional[str] = None
 _report_model: Optional[str] = None
+_job_models: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "vuln_agent_job_models", default=None)
+
+
+def bind_models(models: Optional[dict] = None):
+    """Bind immutable model ids to the current task and its child tasks."""
+    snapshot = dict(models or get_models())
+    return _job_models.set(snapshot)
+
+
+def reset_models(token) -> None:
+    _job_models.reset(token)
 
 _client: Optional[httpx.AsyncClient] = None
 
 
 def _detect() -> str:
-    return _detect_model or MODEL_DETECT
+    bound = _job_models.get()
+    return (bound or {}).get("detect") or _detect_model or MODEL_DETECT
 
 
 def _report() -> str:
-    return _report_model or MODEL_REPORT
+    bound = _job_models.get()
+    return (bound or {}).get("report") or _report_model or MODEL_REPORT
 
 
 def get_models() -> dict:

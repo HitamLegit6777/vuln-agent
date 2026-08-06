@@ -6,6 +6,7 @@ ponytail: cache is pluggable via `cache_get/cache_set` callables wired later by 
 from __future__ import annotations
 
 import asyncio
+import time
 import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Optional
@@ -23,6 +24,41 @@ HEADERS = {
 }
 TIMEOUT = httpx.Timeout(25.0, connect=10.0)
 _LIMITS = httpx.Limits(max_connections=30, max_keepalive_connections=15, keepalive_expiry=30.0)
+
+
+class Outcome:
+    """Source fetch outcome categories (see classify_http). Shared with registry."""
+    SUCCESS = "success"          # 2xx/3xx — source answered
+    CLIENT_ERROR = "client_error"  # 4xx except 429 — answered, query-level negative
+    RATE_LIMITED = "rate_limited"  # 429 — server-mandated backoff (Retry-After)
+    HTTP_ERROR = "http_error"    # 5xx — server-side failure
+    TIMEOUT = "timeout"          # per-source deadline exceeded
+    NETWORK_ERROR = "network_error"  # transport/connect/parse failure
+    SKIPPED = "skipped"          # circuit open — not attempted
+
+
+_RATE_LIMIT_COOLDOWN_DEFAULT = 60.0  # bare 429 without Retry-After
+
+
+def retry_after_cooldown(retry_after) -> float:
+    """Seconds to back off from an HTTP Retry-After header (numeric form only)."""
+    if retry_after:
+        try:
+            return max(0.0, float(str(retry_after).strip()))
+        except ValueError:
+            pass  # HTTP-date form → default
+    return _RATE_LIMIT_COOLDOWN_DEFAULT
+
+
+def classify_http(status_code: int, retry_after=None) -> tuple[str, float]:
+    """Classify an HTTP status into (Outcome, cooldown_seconds)."""
+    if status_code == 429:
+        return Outcome.RATE_LIMITED, retry_after_cooldown(retry_after)
+    if status_code >= 500:
+        return Outcome.HTTP_ERROR, 0.0
+    if status_code >= 400:
+        return Outcome.CLIENT_ERROR, 0.0
+    return Outcome.SUCCESS, 0.0
 
 
 @dataclass
@@ -217,6 +253,28 @@ class BaseScraper:
         self._client = client
         self._cache_get = cache_get
         self._cache_set = cache_set
+        self._health_cb = None  # optional sync callback(outcome_info) wired by registry
+
+    def set_health_cb(self, cb: Optional[Callable]) -> None:
+        """Attach a health-outcome reporter (see Outcome). Best-effort, never raises."""
+        self._health_cb = cb
+
+    def _report(self, *, status_code: Optional[int] = None, retry_after=None,
+                exc: Optional[BaseException] = None, latency: float = 0.0) -> None:
+        cb = self._health_cb
+        if cb is None:
+            return
+        try:
+            if status_code is not None:
+                outcome, cooldown = classify_http(status_code, retry_after)
+            elif isinstance(exc, httpx.TimeoutException):
+                outcome, cooldown = Outcome.TIMEOUT, 0.0
+            else:
+                outcome, cooldown = Outcome.NETWORK_ERROR, 0.0
+            cb({"name": self.name, "outcome": outcome, "cooldown": cooldown,
+                "latency": latency, "error": repr(exc) if exc is not None else ""})
+        except Exception:
+            pass
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -233,21 +291,42 @@ class BaseScraper:
             self._client = None
 
     async def _get_text(self, url: str, **kw) -> Optional[str]:
+        t0 = time.monotonic()
         try:
             r = await self.client.get(url, **kw)
+            self._report(status_code=r.status_code, retry_after=r.headers.get("Retry-After"),
+                         latency=time.monotonic() - t0)
             if r.status_code >= 400:
                 return None
             return r.text
         except (httpx.HTTPError, httpx.InvalidURL) as e:
+            self._report(exc=e, latency=time.monotonic() - t0)
             return None
 
     async def _get_json(self, url: str, **kw) -> Optional[Any]:
+        t0 = time.monotonic()
         try:
             r = await self.client.get(url, **kw)
+            self._report(status_code=r.status_code, retry_after=r.headers.get("Retry-After"),
+                         latency=time.monotonic() - t0)
             if r.status_code >= 400:
                 return None
             return r.json()
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError) as e:
+            self._report(exc=e, latency=time.monotonic() - t0)
+            return None
+
+    async def _post_json(self, url: str, json_body: Any, **kw) -> Optional[Any]:
+        t0 = time.monotonic()
+        try:
+            r = await self.client.post(url, json=json_body, **kw)
+            self._report(status_code=r.status_code, retry_after=r.headers.get("Retry-After"),
+                         latency=time.monotonic() - t0)
+            if r.status_code >= 400:
+                return None
+            return r.json()
+        except (httpx.HTTPError, ValueError) as e:
+            self._report(exc=e, latency=time.monotonic() - t0)
             return None
 
     async def _post_json(self, url: str, json_body: Any, **kw) -> Optional[Any]:

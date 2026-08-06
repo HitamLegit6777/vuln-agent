@@ -45,8 +45,10 @@ def test_report_ranks_and_bands():
     # must land in the actionable HIGH/CRITICAL range (verified +60 dominates)
     assert all(v.get("risk_band") for v in rep["exploitable"])
     assert all(v["risk_band"] in ("HIGH", "CRITICAL") for v in rep["exploitable"])
-    # safe one is in checked, not exploitable
-    assert [c["cve"] for c in rep["checked"]] == ["CVE-2099-SAFE"]
+    # "version patched" is a deterministic NOT_APPLICABLE — sits in not_applicable,
+    # not in checked (NOT_REPRODUCED)
+    assert rep["checked"] == []
+    assert [c["cve"] for c in rep["not_applicable"]] == ["CVE-2099-SAFE"]
 
 
 def test_render_report_shows_risk_band():

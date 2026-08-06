@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import re
 import uuid
 from typing import Optional, Callable, Awaitable
@@ -273,6 +274,29 @@ async def _ingest_library_vulns(findings: dict) -> None:
         except Exception as e:
             log.warning("library ingest %s skipped: %s", v.get("cve"), e)
 
+
+
+async def _ingest_verify_strategy(cve: str, res: dict, verdict: str, reason: str,
+                                  waf: str = "", timing_ms: int = 0) -> None:
+    """Best-effort: persist the exploit methods tried for a CVE (strategy memory).
+    Idempotent upsert per (cve, method, result) in the library — re-verification
+    of the same outcome bumps the hits counter instead of duplicating rows.
+    Never breaks a scan: every failure degrades to a log line."""
+    try:
+        import library as _lib
+    except Exception as e:
+        log.info("library unavailable (strategy ingest skipped): %s", e)
+        return
+    methods = [str(m)[:120] for m in (res.get("methods_tried") or [])][:6] or ["none"]
+    detail = {"attempts": int(res.get("attempts") or 0), "timing_ms": int(timing_ms or 0)}
+    for m in methods:
+        try:
+            await _lib.ingest_strategy({
+                "cve": str(cve).upper(), "method": m, "result": verdict,
+                "reason": str(reason or "")[:1000], "waf": str(waf or "")[:200],
+                "path": str(res.get("path") or "")[:400], "detail": detail})
+        except Exception as e:
+            log.debug("strategy ingest %s/%s skipped: %s", cve, m, e)
 
 async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
     """Phase 1: detect stack + parallel search_vuln + parallel fetch_cve_detail.
@@ -562,12 +586,13 @@ async def _enrich_kev(cands: list) -> set:
             v["kev"] = True
     return matched
 
-
 async def run_verify(findings_str: str, scan_id: str, target: str,
                      progress: Optional[Callable[[int, str], Awaitable]] = None
                      ) -> str:
-    """For each candidate CVE in findings, build+run PoC (--check) → real EXPLOITABLE/NOT
-    verdict. Merges verdicts back into findings. Capped to top candidates."""
+    """For each candidate CVE in findings, build+run PoC (--check) → canonical verdict
+    (EXPLOITABLE / NOT_REPRODUCED / NOT_APPLICABLE / INCONCLUSIVE / UNREACHABLE).
+    Merges verdicts back into findings and persists per-CVE exploit strategies to the
+    library (idempotent). Capped to top candidates."""
     try:
         f = json.loads(findings_str)
     except Exception:
@@ -595,6 +620,17 @@ async def run_verify(findings_str: str, scan_id: str, target: str,
     except Exception:
         pass
 
+    # WAF names from the research phase — recorded on each strategy row so prior
+    # context can hint at bypasses that worked under the same WAF. Best-effort.
+    waf_names = ""
+    try:
+        waf_names = ", ".join(str(w.get("name")) for w in (f.get("waf") or [])
+                              if isinstance(w, dict) and w.get("name"))
+        if not waf_names:
+            waf_names = str(f.get("waf_summary") or "")
+    except Exception:
+        pass
+
     # PARALLEL PoC verification — 10 subagents concurrent, NO timeout (let them finish)
     _verify_sem = asyncio.Semaphore(10)
     _done_count = 0
@@ -610,35 +646,56 @@ async def run_verify(findings_str: str, scan_id: str, target: str,
             try:
                 # wall-clock cap per candidate — run_poc's LLM loop is bounded by steps
                 # but 30 steps × slow reasoning model can still stall the whole scan
+                t0 = time.perf_counter()
+                timeout = False
+                error = False
                 res = await asyncio.wait_for(run_poc(scan_id, cve, target), timeout=600)
             except asyncio.TimeoutError:
-                res = {"verdict": "NOT EXPLOITABLE", "reason": "verify timeout (600s per candidate)",
+                timeout = True
+                res = {"verdict": "INCONCLUSIVE", "reason": "verify timeout (600s per candidate)",
                        "attempts": 0, "path": ""}
             except Exception as e:
-                res = {"verdict": "NOT EXPLOITABLE", "reason": f"verify err: {e}", "attempts": 0, "path": ""}
-        # SERVER-SIDE PROOF VALIDATION: downgrade EXPLOITABLE if no direct proof
+                error = True
+                res = {"verdict": "INCONCLUSIVE", "reason": f"verify err: {e}",
+                       "attempts": 0, "path": ""}
+            timing_ms = int((time.perf_counter() - t0) * 1000) if not timeout and not error else 0
+        # SERVER-SIDE VERDICT STATE MACHINE (agent.scoring): maps legacy
+        # NOT EXPLOITABLE/NOT_EXPLOITABLE -> NOT_REPRODUCED (or NOT_APPLICABLE when the
+        # reason says version out of range/patched), timeout/error -> INCONCLUSIVE (or
+        # UNREACHABLE on connectivity evidence), weak EXPLOITABLE proof -> NOT_REPRODUCED.
         raw_verdict = (res.get("verdict") or "UNKNOWN").upper()
         raw_reason = res.get("reason", "")
-        validated_verdict, validated_reason = _validate_exploitable(raw_verdict, raw_reason)
-        v["verified"] = validated_verdict
-        v["verify_reason"] = validated_reason
+        verdict, reason = _scoring.normalize_verdict(raw_verdict, raw_reason,
+                                                     timeout=timeout, error=error)
+        v["verified"] = verdict
+        v["verify_reason"] = reason
         v["verify_attempts"] = res.get("attempts", 0)
         v["verify_methods"] = res.get("methods_tried", [])
         v["poc_path"] = res.get("path", "")
+        v["confidence"] = _scoring.verdict_confidence(verdict, attempts=v["verify_attempts"],
+                                                      reason=reason)
+        v["verify_timing_ms"] = timing_ms
+        try:
+            await _ingest_verify_strategy(cve, res, verdict, reason,
+                                          waf=waf_names, timing_ms=timing_ms)
+        except Exception as e:
+            log.warning("strategy ingest %s skipped: %s", cve, e)
         _done_count += 1
         if progress:
-            try: await progress(_done_count, f"verified {cve}: {validated_verdict} ({_done_count}/{_total})")
+            try: await progress(_done_count, f"verified {cve}: {verdict} ({_done_count}/{_total})")
             except: pass
         return v
 
     # run all verifications in parallel (no timeout — let them finish)
-    await asyncio.gather(*[_verify_one(v) for v in cands], return_exceptions=True)
     f["vulnerabilities"] = cands
     return json.dumps(f, ensure_ascii=False)
 
 async def run_report(target: str, findings: str) -> dict:
     """Render Telegram report JSON from findings. FULLY GROUNDED — the CVE list is built
-    deterministically from findings (verified field), so the LLM cannot hallucinate CVEs.
+    deterministically from findings, normalizing every `verified` value through the
+    verdict state machine (agent.scoring) so legacy/old stored verdicts render safely.
+    Statuses: EXPLOITABLE / NO_EXPLOIT_REPRODUCED / INCONCLUSIVE / UNREACHABLE — a
+    scan whose verification timed out or errored is INCONCLUSIVE, never reported clean.
     The LLM is used ONLY for the recommendation text (1 short call)."""
     try:
         f = json.loads(findings)
@@ -648,16 +705,25 @@ async def run_report(target: str, findings: str) -> dict:
     stack = f.get("stack", []) or []
     stack_summary = _stack_summary(stack)
 
-    exploitable = []
-    checked = []
+    exploitable: list[dict] = []
+    checked: list[dict] = []
+    not_applicable: list[dict] = []
+    inconclusive: list[dict] = []
+    verdicts: list[str] = []
     itw_list = f.get("exploited_in_wild", []) or []
     itw_set = {str(c).upper() for c in itw_list}
     for v in vulns:
         cve = v.get("cve")
         if not cve:
             continue
-        verified = str(v.get("verified", "")).upper()
-        if verified == "EXPLOITABLE":
+        verified = str(v.get("verified") or "").strip()
+        if not verified:
+            continue  # candidate never verified — not bucketed (matches legacy)
+        verdict, reason = _scoring.normalize_verdict(verified, v.get("verify_reason", ""))
+        verdicts.append(verdict)
+        attempts = v.get("verify_attempts") or 0
+        confidence = _scoring.verdict_confidence(verdict, attempts=attempts, reason=reason)
+        if verdict == "EXPLOITABLE":
             # reconcile score+severity from possibly-partial source data (vector or label)
             score, sev = _cvss.enrich(v.get("cvss"), v.get("severity"),
                                       v.get("cvss_vector") or v.get("vector"))
@@ -668,23 +734,33 @@ async def run_report(target: str, findings: str) -> dict:
                 "severity": sev or v.get("severity"), "cvss": score if score is not None else v.get("cvss"),
                 "component": v.get("component"), "title": v.get("title"),
                 "summary": (v.get("description") or v.get("summary") or "")[:200],
-                "verify_reason": (v.get("verify_reason") or "")[:300],
+                "verify_reason": (reason or "")[:300],
                 "poc_refs": v.get("poc_refs", []), "diff_patch": v.get("diff_patch"),
                 "sources": v.get("sources", []),
                 "epss": v.get("epss"), "kev": in_kev,
+                "confidence": confidence, "verify_attempts": attempts,
             }
             item.update(_scoring.score_finding(
                 item, epss=v.get("epss"), kev=in_kev,
                 exploited_in_wild=in_kev))
             exploitable.append(item)
-        elif verified:  # NOT EXPLOITABLE / UNKNOWN -> checked
-            checked.append({"cve": cve, "verify_reason": (v.get("verify_reason") or "")[:120] or verified})
+        else:
+            entry = {"cve": cve,
+                     "verify_reason": (reason or "")[:120] or verdict,
+                     "confidence": confidence, "verify_attempts": attempts}
+            if verdict == "NOT_REPRODUCED":
+                checked.append(entry)
+            elif verdict == "NOT_APPLICABLE":
+                not_applicable.append(entry)
+            else:  # INCONCLUSIVE / UNREACHABLE
+                inconclusive.append(entry)
     # rank exploitable so the highest-risk (verified + in-the-wild + high EPSS/CVSS) leads
     exploitable.sort(key=lambda x: x.get("risk", 0.0), reverse=True)
-    status = "EXPLOITABLE" if exploitable else "CLEAN"
+    coverage = _scoring.report_coverage(verdicts)
 
-    # Check if target was unreachable (no stack + nothing checked = probe never got data)
-    stack_empty = not stack and not exploitable and not checked
+    # Check if target was unreachable (no stack + nothing verified = probe never got data)
+    stack_empty = not stack and not exploitable and not checked \
+        and not not_applicable and not inconclusive
     if stack_empty:
         # Short-circuit: nothing to recommend patching, just tell the user it was unreachable.
         recommendation = ("Target tidak bisa dijangkau dari server. Kemungkinan down, "
@@ -692,27 +768,42 @@ async def run_report(target: str, findings: str) -> dict:
                           "gunakan URL alternatif (HTTPS/WWW).")
         return {"target": target, "stack_summary": stack_summary, "status": "UNREACHABLE",
                 "exploitable": [], "checked": [],
+                "not_applicable": [], "inconclusive": [], "coverage": coverage,
                 "exploited_in_wild": f.get("exploited_in_wild", []),
                 "recommendation": recommendation,
                 "waf": f.get("waf", []),
                 "waf_summary": f.get("waf_summary", ""),
                 "waf_may_mask": f.get("waf_may_mask", False)}
 
-    # Deterministic recommendation (no LLM meta-text risk). The CVE list is already fixed
-    # above from the `verified` field, so this text cannot introduce new/hallucinated CVEs.
+    # Deterministic status — precedence: definite exploit > definite negative >
+    # inconclusive (timeouts/errors must never render as clean) > nothing to test.
     if exploitable:
+        status = "EXPLOITABLE"
         cve_list = ", ".join(v["cve"] for v in exploitable[:5])
         cms_name = next((s.get("name") for s in stack if s.get("type") in ("cms", "core")), "")
         cms_ver = next((s.get("version") for s in stack if s.get("type") in ("cms", "core")), "")
         recommendation = (f"Segera update {cms_name or 'software'} dari versi {cms_ver or 'terkini'} "
                           f"ke versi terbaru untuk menambal {len(exploitable)} kerentanan exploitable "
                           f"({cve_list}). Audit log server untuk indikasi kompromi.")
+    elif checked or not_applicable:
+        status = "NO_EXPLOIT_REPRODUCED"
+        recommendation = ("No exploitable vulnerabilities reproduced for the detected "
+                          "stack/versions. Keep software updated and monitor advisories.")
+    elif any(v.get("cve") for v in vulns):
+        # candidates existed but verification produced no definite verdict (timeout/error)
+        status = "INCONCLUSIVE"
+        recommendation = ("Verifikasi exploit tidak tuntas: semua kandidat berakhir "
+                          "timeout/error tanpa verdict definitif. Status INCONCLUSIVE, "
+                          "bukan bersih — coba scan ulang atau periksa konektivitas target.")
     else:
-        recommendation = ("No exploitable vulnerabilities found for the detected stack/versions. "
+        status = "NO_EXPLOIT_REPRODUCED"
+        recommendation = ("No potential vulnerabilities found for the detected stack/versions. "
                           "Keep software updated and monitor advisories.")
 
     return {"target": target, "stack_summary": stack_summary, "status": status,
             "exploitable": exploitable, "checked": checked,
+            "not_applicable": not_applicable, "inconclusive": inconclusive,
+            "coverage": coverage,
             "exploited_in_wild": f.get("exploited_in_wild", []),
             "recommendation": recommendation,
             "waf": f.get("waf", []),
@@ -747,45 +838,12 @@ def _parse_run_verdict(run_output: str) -> tuple[str, str]:
         return "NOT EXPLOITABLE", m.group(1).strip()[:500]
     return "", ""
 
-
-# Weak evidence patterns — if EXPLOITABLE reason contains these, it's circumstantial
-_WEAK_PATTERNS = [
-    "version in range", "version is within", "detected version", "affected range",
-    "http 200", "status 200", "returned 200", "http 302", "redirect",
-    "endpoint accessible", "endpoint returned", "returned http",
-    "advisory says", "cve advisory", "vulnerable version",
-    "empty data", "data:[]", "success\":true", "no authentication required",
-]
-# Direct proof patterns — if EXPLOITABLE reason contains these, it's genuine
-_STRONG_PATTERNS = [
-    "reflected", "marker", "uid=", "gid=", "www-data", "root:x:0",
-    "command output", "echo ", "sleep confirmed", "delay measured",
-    "uploaded file", "file accessible", "webshell", "php executed",
-    "sql", "database", "query returned", "data exfil",
-    "admin dashboard", "authenticated content", "user list",
-    "privilege escalated", "group changed", "user created",
-    "api key", "credential", "secret", "config leaked",
-    "rce confirmed", "code execution", "payload executed",
-    "math result", "arithmetic", "3105",
-]
-
-
-def _validate_exploitable(verdict: str, reason: str) -> tuple[str, str]:
-    """Server-side proof validation. Downgrade EXPLOITABLE to NOT EXPLOITABLE
-    if the reason contains only circumstantial evidence (no direct proof)."""
-    if verdict.upper() != "EXPLOITABLE":
-        return verdict, reason
-    reason_lower = (reason or "").lower()
-    # check for strong proof patterns
-    has_strong = any(p in reason_lower for p in _STRONG_PATTERNS)
-    has_weak = any(p in reason_lower for p in _WEAK_PATTERNS)
-    if has_strong:
-        return verdict, reason  # direct proof present — keep EXPLOITABLE
-    if has_weak and not has_strong:
-        # only circumstantial evidence — downgrade
-        return "NOT EXPLOITABLE", f"Version in range but no direct exploitation proof. PoC claimed EXPLOITABLE but reason only shows circumstantial evidence: {reason[:150]}"
-    # if neither strong nor weak patterns match, be conservative
-    return "NOT EXPLOITABLE", f"No direct proof found in verify reason. {reason[:150]}"
+# Verdict normalization lives in agent.scoring (single canonical state machine):
+# _scoring.normalize_verdict maps legacy NOT EXPLOITABLE/NOT_EXPLOITABLE to
+# NOT_REPRODUCED (or NOT_APPLICABLE when the reason says version out of
+# range/patched), timeouts/errors to INCONCLUSIVE/UNREACHABLE, and downgrades
+# weak-proof EXPLOITABLE claims to NOT_REPRODUCED. Confidence + coverage are
+# _scoring.verdict_confidence / _scoring.report_coverage.
 
 
 async def run_poc(scan_id: str, cve: str, target: str) -> dict:
@@ -908,6 +966,22 @@ async def run_poc(scan_id: str, cve: str, target: str) -> dict:
             detail = detail + "\n\n=== ADVISORY/PATCH/SOURCE CONTEXT (fetched — use this to understand the fix + reverse-engineer the exploit) ===" + extra_ctx
     if waf_bypass_hint:
         detail += f"\n\nKNOWN WAF BYPASSES (from prior scans):{waf_bypass_hint}\nTry these payload variants first if the target has a WAF."
+
+    # SELF-IMPROVEMENT: prior exploit strategies for this exact CVE (successful +
+    # failed methods from this agent's library). Bounded, best-effort: reuse what
+    # worked on earlier targets, skip what already failed for a clear reason.
+    try:
+        import library as _lib
+        strats = await _lib.strategy_context(cve_u, limit=6)
+        if strats:
+            strat_lines = [
+                f"- [{s.get('result')} x{s.get('hits', 1)}] {s.get('method')}: "
+                f"{(s.get('reason') or '')[:110]}"
+                for s in strats]
+            detail += ("\n\n=== PRIOR EXPLOIT STRATEGY (same CVE, from this agent's library) ===\n"
+                       + "\n".join(strat_lines) + "\n")
+    except Exception:
+        pass  # best-effort — never block PoC generation on library state
     msg = bp.build_poc_messages(cve, target, detail)
     messages: list[dict] = list(msg)
     last_run_output = ""
@@ -991,7 +1065,7 @@ async def run_self_reflect(target: str, findings: str, scan_id: str) -> str:
         f"WAF: {waf or 'none'}\n"
         f"Vulns found: {len(vulns)} (exploitable: {len(exploitable)})\n"
         f"Exploitable CVEs: {', '.join(v.get('cve','') for v in exploitable[:5])}\n"
-        f"Tested but not exploitable: {len([v for v in vulns if str(v.get('verified','')).upper() == 'NOT EXPLOITABLE'])}\n"
+        f"Tested but not exploitable: {len([v for v in vulns if str(v.get('verified','')).upper().replace('-', '_').replace(' ', '_') in ('NOT_EXPLOITABLE', 'NOT_REPRODUCED', 'NOT_APPLICABLE')])}\n"
     )
 
     try:

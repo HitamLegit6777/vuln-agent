@@ -93,70 +93,60 @@ def _sev_line(v: dict) -> str:
 
 
 def render_report(report: dict, scan_id: str) -> list[str]:
-    """Return list of HTML message chunks. Binary EXPLOITABLE/CLEAN status."""
-    parts: list[str] = []
+    """Render structured Bot API 10.2 rich HTML; legacy conversion is centralized."""
     target = report.get("target", "?")
-    status = (report.get("status") or "UNKNOWN").upper()
-    if status == "UNREACHABLE":
-        status_line = "<b>STATUS: TARGET UNREACHABLE</b>"
-    elif status == "EXPLOITABLE":
-        status_line = "<b>STATUS: EXPLOITABLE</b>"
-    else:
-        status_line = "<b>STATUS: CLEAN</b>"
-    head = (f"<b>Vuln Scan Report</b>\n"
-            f"{status_line}\n"
-            f"<b>Target:</b> {_e(target)}\n"
-            f"<b>Scan ID:</b> <code>{_e(scan_id)}</code>\n")
-    ss = report.get("stack_summary")
-    if ss:
-        head += f"<b>Stack:</b> {_e(ss)}\n"
-    waf_summary = report.get("waf_summary")
-    if waf_summary:
-        head += f"<b>WAF/CDN:</b> {_e(waf_summary)}\n"
-        if report.get("waf_may_mask"):
-            head += ("<b>WARNING:</b> WAF aktif — PoC --check mungkin diblok (false NOT EXPLOITABLE). "
-                     "Verdict = CLEAN mungkin ter-masked.\n")
-    eiw = report.get("exploited_in_wild") or []
-    if eiw:
-        head += f"<b>In-the-wild (KEV):</b> {', '.join(_e(c) for c in eiw)}\n"
-    parts.append(head)
-
+    status = (report.get("status") or "INCONCLUSIVE").upper()
+    labels = {
+        "EXPLOITABLE": "EXPLOITABLE",
+        "NO_EXPLOIT_REPRODUCED": "NO EXPLOIT REPRODUCED",
+        "INCONCLUSIVE": "INCONCLUSIVE",
+        "UNREACHABLE": "TARGET UNREACHABLE",
+    }
+    coverage = report.get("verdict_coverage", report.get("coverage"))
+    confidence = report.get("confidence")
+    rows = [
+        ["Status", f"<b>{_e(labels.get(status, status))}</b>"],
+        ["Target", f"<code>{_e(target)}</code>"],
+        ["Scan", f"<code>{_e(scan_id)}</code>"],
+    ]
+    if isinstance(coverage, (int, float)):
+        rows.append(["Coverage", f"{coverage:.0%}"])
+    if isinstance(confidence, (int, float)):
+        rows.append(["Confidence", f"{confidence:.0%}"])
+    if report.get("stack_summary"):
+        rows.append(["Stack", _e(report["stack_summary"])])
+    if report.get("waf_summary"):
+        rows.append(["WAF/CDN", _e(report["waf_summary"])])
+    table = "<table bordered striped>" + "".join(
+        f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in rows) + "</table>"
+    parts = [f"<h1>Vulnerability Scan Report</h1>{table}<hr/>"]
+    if report.get("waf_may_mask"):
+        parts.append("<blockquote><b>Warning:</b> WAF may mask active checks; blocked tests are INCONCLUSIVE, never clean.</blockquote>")
     exploitable = report.get("exploitable") or []
     checked = report.get("checked") or []
-
-    if status == "EXPLOITABLE" and exploitable:
-        parts.append(f"\n<b>Exploitable ({len(exploitable)}):</b>")
-        for i, v in enumerate(exploitable, 1):
-            block = (f"\n<b>{i}. {_e(v.get('cve'))}</b> {_sev_line(v)}\n"
-                     f"<b>Component:</b> {_e(v.get('component') or '-')}\n"
-                     f"<b>Title:</b> {_e(v.get('title') or '-')}\n"
-                     f"<b>Summary:</b> {_e(v.get('summary') or '-')}\n"
-                     f"<b>Verified:</b> {_e(v.get('verify_reason') or '-')}\n")
-            refs = v.get("poc_refs") or []
-            if refs:
-                block += "<b>PoC:</b> " + " | ".join(
-                    f'<a href="{_e(u)}">link{n+1}</a>' for n, u in enumerate(refs[:3])
-                ) + "\n"
-            dp = v.get("diff_patch")
-            if dp:
-                block += f'<b>Patch:</b> <a href="{_e(dp)}">diff</a>\n'
-            srcs = v.get("sources") or []
-            if srcs:
-                block += f"<b>Sources:</b> {_e(', '.join(srcs))}\n"
-            parts.append(block)
+    inconclusive = report.get("inconclusive") or []
+    not_applicable = report.get("not_applicable") or []
+    if exploitable:
+        parts.append(f"<h2>Confirmed exploitable ({len(exploitable)})</h2>")
+        for v in exploitable:
+            body = (f"<p>{_sev_line(v)}<br/><b>Component:</b> {_e(v.get('component') or '-')}<br/>"
+                    f"<b>Title:</b> {_e(v.get('title') or '-')}<br/>"
+                    f"<b>Proof:</b> {_e(v.get('verify_reason') or '-')}</p>")
+            parts.append(f"<details open><summary><b>{_e(v.get('cve'))}</b></summary>{body}</details>")
     else:
-        parts.append("\n<i>No exploitable vulnerabilities confirmed (CLEAN).</i>")
-
+        parts.append("<p><i>No exploit was confirmed. This does not mean the target is vulnerability-free.</i></p>")
     if checked:
-        parts.append(f"\n<b>Tested but not exploitable ({len(checked)}):</b>")
-        for c in checked:
-            parts.append(f"  <code>{_e(c.get('cve'))}</code> — {_e(c.get('verify_reason') or '-')}")
-
-    rec = report.get("recommendation")
-    if rec:
-        parts.append(f"\n<b>Recommendation</b>\n{_e(rec)}")
-
-    parts.append(f"\n<i>PoC sudah dibuild+test saat scan. Klik</i> <b>Get PoC</b> <i>utk ambil script.</i>")
+        parts.append(f"<h2>Not reproduced ({len(checked)})</h2><ul>" + "".join(
+            f"<li><code>{_e(v.get('cve'))}</code> — {_e(v.get('verify_reason') or '-')}</li>" for v in checked) + "</ul>")
+    if inconclusive:
+        parts.append(f"<h2>Inconclusive ({len(inconclusive)})</h2><ul>" + "".join(
+            f"<li><code>{_e(v.get('cve'))}</code> — {_e(v.get('verify_reason') or '-')}</li>" for v in inconclusive) + "</ul>")
+    if not_applicable:
+        parts.append(f"<details><summary>Not applicable ({len(not_applicable)})</summary><ul>" + "".join(
+            f"<li><code>{_e(v.get('cve'))}</code> — {_e(v.get('verify_reason') or '-')}</li>" for v in not_applicable) + "</ul></details>")
+    if report.get("recommendation"):
+        parts.append(f"<h2>Recommendation</h2><p>{_e(report['recommendation'])}</p>")
+    parts.append("<footer>PoCs were built and checked during this scan. Use Get PoC to retrieve artifacts.</footer>")
     return _split(parts)
 
 

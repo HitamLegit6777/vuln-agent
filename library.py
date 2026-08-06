@@ -37,6 +37,7 @@ def _target_key(target: Any) -> str:
 
 import db as _db
 from scrapers.registry import build_scrapers, get_all
+from agent.scoring import VERDICTS  # leaf module — canonical verdict set
 
 _TS = "%Y-%m-%d %H:%M:%S"
 _REFRESH_TTL = 7 * 86400          # refresh_due() interval
@@ -687,11 +688,27 @@ def init_library_sync() -> None:
           created TEXT, updated TEXT
         );
 
+
+        CREATE TABLE IF NOT EXISTS lib_strategy(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          cve TEXT NOT NULL,
+          method TEXT NOT NULL DEFAULT '',
+          result TEXT NOT NULL DEFAULT '',
+          reason TEXT DEFAULT '',
+          waf TEXT DEFAULT '',
+          path TEXT DEFAULT '',
+          detail TEXT DEFAULT '{}',
+          hits INTEGER DEFAULT 1,
+          created TEXT, updated TEXT,
+          UNIQUE(cve, method, result)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lib_strategy_cve ON lib_strategy(cve, updated);
+
         CREATE TABLE IF NOT EXISTS lib_meta(
           key TEXT PRIMARY KEY, value TEXT
         );
         """)
-        c.execute("INSERT OR REPLACE INTO lib_meta(key, value) VALUES('schema_version', '1')")
+        c.execute("INSERT OR REPLACE INTO lib_meta(key, value) VALUES('schema_version', '2')")
     _FTS = False
     try:
         with _tx() as c:
@@ -1194,6 +1211,118 @@ async def add_note(user_id: Any, entity_id: str, note: str, tags: Any = None) ->
         return await asyncio.to_thread(_add_note_sync, user_id, entity_id, note, tags)
 
 
+
+# ---- exploit strategy memory ------------------------------------------------
+# Additive per-CVE exploit-method memory. Each verify phase ingests one row per
+# method tried; (cve, method, result) is UNIQUE so re-verification of the same
+# outcome bumps `hits` instead of duplicating rows (idempotent enough for the
+# ingest-after-every-verify contract). Retrieval ranks by outcome (EXPLOITABLE
+# first) then hits/recency, so PoC prompts see what worked before.
+
+
+def _norm_strategy(record: dict) -> dict:
+    """Normalize one strategy record defensively (schema may evolve)."""
+    record = record or {}
+    result = str(record.get("result") or "").strip().upper()
+    if result not in VERDICTS:
+        result = "INCONCLUSIVE"
+    detail = record.get("detail")
+    return {
+        "cve": str(record.get("cve") or "").strip().upper()[:128],
+        "method": str(record.get("method") or "")[:120] or "none",
+        "result": result,
+        "reason": str(record.get("reason") or "")[:1000],
+        "waf": str(record.get("waf") or "")[:200],
+        "path": str(record.get("path") or "")[:400],
+        "detail": detail if isinstance(detail, dict) else {},
+    }
+
+
+def _ingest_strategy_in_txn(c: sqlite3.Connection, record: dict) -> dict:
+    """Upsert one strategy row. Caller holds a transaction. Idempotent per
+    (cve, method, result): same outcome again just bumps `hits` + refreshes."""
+    d = _norm_strategy(record)
+    now = _now()
+    existing = c.execute(
+        "SELECT id, hits FROM lib_strategy WHERE cve=? AND method=? AND result=?",
+        (d["cve"], d["method"], d["result"])).fetchone()
+    if existing:
+        c.execute(
+            "UPDATE lib_strategy SET reason=?, waf=?, path=?, detail=?, hits=hits+1,"
+            " updated=? WHERE id=?",
+            (d["reason"], d["waf"], d["path"], json.dumps(d["detail"], ensure_ascii=False),
+             now, existing["id"]))
+        return {"cve": d["cve"], "method": d["method"], "result": d["result"],
+                "hits": existing["hits"] + 1, "updated": True}
+    c.execute(
+        "INSERT INTO lib_strategy(cve, method, result, reason, waf, path, detail,"
+        " hits, created, updated) VALUES(?,?,?,?,?,?,?,1,?,?)",
+        (d["cve"], d["method"], d["result"], d["reason"], d["waf"], d["path"],
+         json.dumps(d["detail"], ensure_ascii=False), now, now))
+    return {"cve": d["cve"], "method": d["method"], "result": d["result"],
+            "hits": 1, "updated": False}
+
+
+def _ingest_strategy_sync(record: dict) -> dict:
+    d = _norm_strategy(record)
+    if not d["cve"]:
+        return {"cve": "", "method": d["method"], "result": d["result"],
+                "hits": 0, "updated": False, "error": "empty cve"}
+    with _tx() as c:
+        return _ingest_strategy_in_txn(c, d)
+
+
+async def ingest_strategy(record: dict) -> dict:
+    """Persist one exploit-method attempt for a CVE (best-effort upsert)."""
+    async with _db._lock:
+        return await asyncio.to_thread(_ingest_strategy_sync, record)
+
+
+_STRATEGY_RANK = ("CASE result WHEN 'EXPLOITABLE' THEN 0 WHEN 'NOT_REPRODUCED' THEN 1"
+                  " WHEN 'NOT_APPLICABLE' THEN 2 WHEN 'INCONCLUSIVE' THEN 3 ELSE 4 END")
+
+
+def _strategy_row(r: sqlite3.Row) -> dict:
+    return {"cve": r["cve"], "method": r["method"], "result": r["result"],
+            "reason": r["reason"], "waf": r["waf"], "path": r["path"],
+            "detail": json.loads(r["detail"] or "{}"), "hits": r["hits"],
+            "created": r["created"], "updated": r["updated"]}
+
+
+def _strategy_context_sync(cve: str, limit: int = 6) -> list[dict]:
+    """Bounded retrieval of prior exploit strategies for ONE CVE, ranked by
+    outcome (EXPLOITABLE first), then hits, then recency — deterministic."""
+    cid = str(cve or "").strip().upper()
+    if not cid:
+        return []
+    limit = max(1, min(int(limit), 20))
+    with _ro() as c:
+        rows = c.execute(
+            f"SELECT * FROM lib_strategy WHERE cve=? ORDER BY {_STRATEGY_RANK},"
+            " hits DESC, updated DESC, id DESC LIMIT ?", (cid, limit)).fetchall()
+        return [_strategy_row(r) for r in rows]
+
+
+async def strategy_context(cve: str, limit: int = 6) -> list[dict]:
+    async with _db._lock:
+        return await asyncio.to_thread(_strategy_context_sync, cve, limit)
+
+
+def _list_strategies_sync(cve: Optional[str] = None, limit: int = 50) -> list[dict]:
+    limit = max(1, min(int(limit), 200))
+    if cve:
+        return _strategy_context_sync(cve, limit=limit)
+    with _ro() as c:
+        rows = c.execute(
+            "SELECT * FROM lib_strategy ORDER BY updated DESC, id DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [_strategy_row(r) for r in rows]
+
+
+async def list_strategies(cve: Optional[str] = None, limit: int = 50) -> list[dict]:
+    async with _db._lock:
+        return await asyncio.to_thread(_list_strategies_sync, cve, limit)
+
 # ---- stats -----------------------------------------------------------------
 def _stats_sync(user_id: Any = None) -> dict:
     with _ro() as c:
@@ -1273,13 +1402,20 @@ def _export_sync(user_id: Any = None) -> str:
                                      "source_name": r["source_name"], "observed": r["observed"],
                                      "kept": r["kept"], "created": r["created"]},
                                     ensure_ascii=False))
+        for r in c.execute("SELECT * FROM lib_strategy ORDER BY id"):
+            lines.append(json.dumps({"type": "strategy", "ts": now, "cve": r["cve"],
+                                     "method": r["method"], "result": r["result"],
+                                     "reason": r["reason"], "waf": r["waf"],
+                                     "path": r["path"],
+                                     "detail": json.loads(r["detail"] or "{}"),
+                                     "hits": r["hits"],
+                                     "created": r["created"], "updated": r["updated"]},
+                                    ensure_ascii=False))
     return "\n".join(lines) + ("\n" if lines else "")
-
 
 async def export_jsonl(user_id: Any = None) -> str:
     async with _db._lock:
         return await asyncio.to_thread(_export_sync, user_id)
-
 
 def _import_jsonl_sync(text: str, user_id: Any = None) -> dict:
     imported = 0
@@ -1413,6 +1549,25 @@ def _import_jsonl_sync(text: str, user_id: Any = None) -> dict:
                                    str(obj.get("observed") or "")[:1024],
                                    str(obj.get("kept") or "")[:1024],
                                    obj.get("created") or _now()))
+            elif t == "strategy":
+                # idempotent: same (cve, method, result) re-import is skipped,
+                # mirroring the ingest upsert key — never duplicates rows.
+                raw_result = str(obj.get("result") or "").strip().upper()
+                if not str(obj.get("cve") or "").strip() or raw_result not in VERDICTS:
+                    skipped += 1
+                    continue
+                rec = {"cve": obj.get("cve"), "method": obj.get("method"),
+                       "result": raw_result, "reason": obj.get("reason"),
+                       "waf": obj.get("waf"), "path": obj.get("path"),
+                       "detail": obj.get("detail") if isinstance(obj.get("detail"), dict) else {}}
+                d = _norm_strategy(rec)
+                with _tx() as c:
+                    dup = c.execute("SELECT 1 FROM lib_strategy WHERE cve=? AND method=?"
+                                    " AND result=?", (d["cve"], d["method"], d["result"])).fetchone()
+                    if dup:
+                        skipped += 1
+                    else:
+                        _ingest_strategy_in_txn(c, d)
                         imported += 1
             else:
                 skipped += 1
@@ -1470,6 +1625,14 @@ def _verify_sync() -> dict:
                     can_n = c.execute("SELECT COUNT(*) FROM lib_canonical").fetchone()[0]
                     if fts_n != can_n:
                         problems.append(f"fts rows {fts_n} != canonical rows {can_n}")
+                n_strat = c.execute("SELECT COUNT(*) FROM lib_strategy").fetchone()[0]
+                row_checks["strategies"] = n_strat
+                bad_strat = c.execute(
+                    "SELECT COUNT(*) FROM lib_strategy WHERE cve='' OR result NOT IN"
+                    " ('EXPLOITABLE','NOT_REPRODUCED','NOT_APPLICABLE',"
+                    " 'INCONCLUSIVE','UNREACHABLE')").fetchone()[0]
+                if bad_strat:
+                    problems.append(f"lib_strategy: {bad_strat} invalid rows")
     except sqlite3.Error as e:
         integrity = "error"
         problems.append(str(e))
@@ -1595,5 +1758,5 @@ __all__ = [
     "search", "recent", "exploitable", "get_vulnerability", "related",
     "target_history", "get_evidence", "stats", "add_note", "export_jsonl",
     "import_jsonl", "backup", "verify_integrity", "refresh_vulnerability",
-    "refresh_due",
+    "refresh_due", "ingest_strategy", "strategy_context", "list_strategies",
 ]

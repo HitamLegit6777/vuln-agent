@@ -23,6 +23,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_IDS = [
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 ]
+ALLOW_PUBLIC_BOT = os.getenv("ALLOW_PUBLIC_BOT", "false").strip().lower() in (
+    "1", "true", "yes", "on")
 
 ROUTER_BASE = os.getenv("ROUTER_BASE", "http://localhost:3000/v1")
 ROUTER_KEY = os.getenv("ROUTER_KEY", "free")
@@ -44,11 +46,15 @@ LLM_MAX_STEPS = int(os.getenv("LLM_MAX_STEPS", "12"))
 
 def allowed(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
-        return True
+        return ALLOW_PUBLIC_BOT
     return int(user_id) in ALLOWED_USER_IDS
 
 
 def assert_configured():
     if not TELEGRAM_BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set in .env", file=sys.stderr)
+        sys.exit(1)
+    if not ALLOWED_USER_IDS and not ALLOW_PUBLIC_BOT:
+        print("ERROR: ALLOWED_USER_IDS is empty (set ALLOW_PUBLIC_BOT=true only intentionally)",
+              file=sys.stderr)
         sys.exit(1)

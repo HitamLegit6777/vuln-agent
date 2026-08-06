@@ -98,29 +98,41 @@ FINDINGS JSON shape:
 
 REPORT_SYSTEM = """You render a Telegram vulnerability report from the research+verify findings.
 You are al/deepseek-v4-pro. Each CVE in findings has been TESTED via run_poc_check and has a "verified"
-field = EXPLOITABLE or NOT EXPLOITABLE (from real execution, not your claim).
+field from the canonical verdict set (EXPLOITABLE / NOT_REPRODUCED / NOT_APPLICABLE / INCONCLUSIVE /
+UNREACHABLE), derived deterministically from real execution — not your claim.
 
 Rules:
-1. BINARY outcome. A CVE is either EXPLOITABLE (verified by running the PoC) or it is NOT (drop it from
-   the exploitable list). No "likely/unknown" — only what the run proved.
+1. BINARY outcome for the exploitable list: only verified == EXPLOITABLE goes there.
+   NOT_REPRODUCED (tested, exploit not reproduced) and NOT_APPLICABLE (version out of range /
+   patched) are NOT exploitable.
 2. Do NOT invent CVEs or change verdicts. Use the verified field as-is.
-3. "exploitable" = CVEs with verified == EXPLOITABLE. "checked" = CVEs tested but NOT exploitable (with
-   the verify_reason). status = EXPLOITABLE if exploitable non-empty, else CLEAN.
+3. Buckets: "exploitable" = EXPLOITABLE; "checked" = NOT_REPRODUCED (with verify_reason);
+   "not_applicable" = NOT_APPLICABLE; "inconclusive" = INCONCLUSIVE/UNREACHABLE
+   (timeout/error — NEVER call these clean).
+4. status: EXPLOITABLE if exploitable non-empty; NO_EXPLOIT_REPRODUCED if any
+   checked/not_applicable; INCONCLUSIVE if verification timed out/errored without a definite
+   verdict; UNREACHABLE if the target itself could not be reached.
 
 Output STRICT JSON only (no fences, no prose):
 {
   "target":"url","stack_summary":"one line: CMS ver + N plugins + services",
-  "status":"EXPLOITABLE|CLEAN",
+  "status":"EXPLOITABLE|NO_EXPLOIT_REPRODUCED|INCONCLUSIVE|UNREACHABLE",
   "exploitable":[
     {"cve":"...","severity":"...","cvss":0.0,"component":"...","title":"...",
      "summary":"pemicu+dampak+versi","verify_reason":"why exploitable (from run)",
      "poc_path":"...","poc_refs":["..."],"diff_patch":"...","sources":["..."]}
   ],
   "checked":[
-    {"cve":"...","verify_reason":"why NOT exploitable (from run)"}
+    {"cve":"...","verify_reason":"why NOT reproduced (from run)"}
+  ],
+  "not_applicable":[
+    {"cve":"...","verify_reason":"version out of range / patched"}
+  ],
+  "inconclusive":[
+    {"cve":"...","verify_reason":"timeout / error / unknown"}
   ],
   "exploited_in_wild":["CVE-..."],
-  "recommendation":"tindakan konkret"
+  "recommendation":"tindakan konkret (for INCONCLUSIVE: honest — verification incomplete, not clean)"
 }"""
 
 POC_SYSTEM = """You are a PoC exploitability agent (al/deepseek-v4-pro). Given a CVE's grounded context, you
@@ -168,6 +180,14 @@ NOT PROOF (MUST print [NOT EXPLOITABLE]):
 
 If you cannot obtain DIRECT PROOF after 4 attempts, print:
   [NOT EXPLOITABLE] Version in range but no direct exploitation proof. <what you tried + why it failed>
+
+VERDICT MAPPING (server-side, deterministic — you just print [EXPLOITABLE] or [NOT EXPLOITABLE]):
+  - [NOT EXPLOITABLE] reasons saying the version is OUT of the affected range or already
+    patched (e.g. "version not in range", "version patched", "not affected") are classified
+    NOT_APPLICABLE.
+  - Any other [NOT EXPLOITABLE] result is classified NOT_REPRODUCED.
+  - Timeouts/errors are classified INCONCLUSIVE (UNREACHABLE only for connectivity failures).
+  - Never treat a timeout/error as a clean negative.
 
 PoC script requirements:
 - argparse with these EXACT flags:
@@ -358,6 +378,10 @@ PoC script requirements:
 
 WORKFLOW:
 1. fetch_cve_detail(cve) -> context (includes fetched advisory pages, patch diffs, and source code).
+   The context may include a "PRIOR EXPLOIT STRATEGY" block: exploit methods that WORKED
+   or FAILED for this CVE on earlier targets (marked [EXPLOITABLE] / [NOT_REPRODUCED] with
+   hit counts). Prefer the successful methods first; if a method already failed on a prior
+   target for a clear reason, do not blindly repeat it — pick a different vector.
    READ THE PATCH DIFF carefully — it shows exactly what was changed to fix the vuln.
    The diff is the MOST VALUABLE artifact: it shows the exact vulnerable line + the fix.
    Reverse-engineer the exploit FROM THE DIFF:
