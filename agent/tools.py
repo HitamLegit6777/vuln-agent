@@ -368,6 +368,76 @@ async def t_run_poc_check(scan_id: str, cve: str, target: str) -> str:
         return f"ERR run: {type(e).__name__}: {e}"
 
 
+
+# ---- private security library (read-only research; notes chat-only) ----
+
+
+def _library_module():
+    """Lazy import of root library.py (created/initialized by db.init_db()).
+    Imported on demand so tools.py stays importable while library.py is
+    bootstrapped alongside the rest of the app."""
+    try:
+        import library as _lib
+        return _lib
+    except Exception:
+        return None
+
+
+def _compact_json(obj, max_len: int = 4000) -> str:
+    """Compact JSON under practical observation limits (runner clips obs at ~5-6k)."""
+    s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 20] + "...[truncated]"
+
+
+async def _library_call(fn_name: str, **kw) -> str:
+    """Call one async library fn; errors serialize as JSON, never raise."""
+    lib = _library_module()
+    if lib is None:
+        return json.dumps({"error": "library unavailable (not initialized)"}, ensure_ascii=False)
+    try:
+        res = await getattr(lib, fn_name)(**kw)
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    if res is None:
+        return json.dumps({"error": "not found"}, ensure_ascii=False)
+    if isinstance(res, str):
+        return res
+    return _compact_json(res)
+
+
+async def t_library_search(query: str, limit: int = 10, user_id: Optional[int] = None) -> str:
+    """Search the private library of known vulnerabilities/scans/monitor intel."""
+    return await _library_call("search", query=query, limit=limit, user_id=user_id)
+
+
+async def t_library_get(canonical_id: str) -> str:
+    """Fetch one canonical vulnerability record by ID (e.g. CVE-2024-1234)."""
+    return await _library_call("get_vulnerability", canonical_id=canonical_id)
+
+
+async def t_library_related(canonical_id_or_query: str, limit: int = 5) -> str:
+    """Semantically related vulnerabilities for a canonical ID or a natural-language query."""
+    return await _library_call("related", canonical_id_or_query=canonical_id_or_query, limit=limit)
+
+
+async def t_library_target_history(user_id: int, target: str, limit: int = 10) -> str:
+    """Past scans/observations for a target owned by the given user_id (ownership-scoped)."""
+    return await _library_call("target_history", user_id=user_id, target=target, limit=limit)
+
+
+async def t_library_evidence(canonical_id: str, user_id: Optional[int] = None, limit: int = 20) -> str:
+    """Evidence trail (sources, observations, notes) behind a canonical vulnerability."""
+    return await _library_call("get_evidence", canonical_id=canonical_id, user_id=user_id, limit=limit)
+
+
+async def t_library_note(user_id: int, entity_id: str, note: str, tags: Optional[str] = None) -> str:
+    """Write a user note attached to a library entity (canonical ID, scan, observation).
+    user_id is REQUIRED (ownership); safe validation is delegated to the library."""
+    return await _library_call("add_note", user_id=user_id, entity_id=entity_id, note=note, tags=tags)
+
+
 # tool registry: name -> (fn, arg names, description)
 TOOLS = {
     "detect_stack": (t_detect_stack, ["url"],
@@ -394,12 +464,28 @@ TOOLS = {
         "Look up a MITRE ATT&CK technique (e.g. T1190 exploit public-facing app, T1059 command exec, T1078 valid accounts, "
         "T1505.003 web shell) → description, real-world threat-actor procedure examples, mitigations. Use to add attack-scenario "
         "context to a CVE/finding (map the vuln type to a technique id)."),
+    "library_search": (t_library_search, ["query", "limit", "user_id"],
+        "Search the private security library (past vulnerabilities, scans, monitor intel). "
+        "Compact JSON results. Use for historical context beyond live scrapers."),
+    "library_get": (t_library_get, ["canonical_id"],
+        "Fetch one canonical vulnerability record by ID (e.g. CVE-2024-1234) from the private library."),
+    "library_related": (t_library_related, ["canonical_id_or_query", "limit"],
+        "Semantically related vulnerabilities for a canonical ID or a natural-language query."),
+    "library_target_history": (t_library_target_history, ["user_id", "target", "limit"],
+        "Past scans/observations for a target owned by the given user_id (ownership-scoped)."),
+    "library_evidence": (t_library_evidence, ["canonical_id", "user_id", "limit"],
+        "Evidence trail (sources, observations, notes) behind a canonical vulnerability."),
+    "library_note": (t_library_note, ["user_id", "entity_id", "note", "tags"],
+        "Write a user note attached to a library entity (canonical ID, scan, observation). "
+        "user_id is REQUIRED; the library validates ownership."),
 }
 
 
-async def dispatch(name: str, args: dict) -> str:
+async def dispatch(name: str, args: dict, allowed: Optional[set] = None) -> str:
     if name not in TOOLS:
         return f"unknown tool: {name}"
+    if allowed is not None and name not in allowed:
+        return f"tool {name} not allowed in this context"
     fn, params, _ = TOOLS[name]
     call_args = {k: args.get(k) for k in params if k in args and args.get(k) is not None}
     try:

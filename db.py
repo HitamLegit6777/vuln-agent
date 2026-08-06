@@ -18,8 +18,10 @@ _CACHE_TTL = 24 * 3600
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30.0)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    c.execute("PRAGMA busy_timeout=30000")
     return c
 
 
@@ -107,6 +109,10 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_sent_cves_cve ON sent_cves(cve);
         """)
+    # Canonical private intelligence library owns its versioned schema separately.
+    # Local import avoids a module cycle: library reuses this module's connection/lock.
+    from library import init_library_sync
+    init_library_sync()
 
 
 # ---- scan history ----
@@ -123,6 +129,13 @@ def _save_scan(scan_id, user_id, target, stack, findings, report, grounded=""):
 def _get_scan(scan_id):
     with _conn() as c:
         r = c.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        return dict(r) if r else None
+
+
+def _get_scan_for_user(scan_id, user_id):
+    with _conn() as c:
+        r = c.execute(
+            "SELECT * FROM scans WHERE id=? AND user_id=?", (scan_id, user_id)).fetchone()
         return dict(r) if r else None
 
 
@@ -168,6 +181,11 @@ async def get_chat(scan_id):
 async def get_scan(scan_id):
     async with _lock:
         return await asyncio.to_thread(_get_scan, scan_id)
+
+
+async def get_scan_for_user(scan_id, user_id):
+    async with _lock:
+        return await asyncio.to_thread(_get_scan_for_user, scan_id, user_id)
 
 
 async def list_scans(user_id, limit=10):

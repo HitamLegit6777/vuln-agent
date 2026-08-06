@@ -12,14 +12,18 @@ _TOOL_DOCS = "\n".join(
     f"- {name}({', '.join(params)}): {desc}"
     for name, (_, params, desc) in T.TOOLS.items()
     if name in ("detect_stack", "search_vuln", "fetch_cve_detail",
-                "version_match", "webfetch", "mitre_lookup")
+                "version_match", "webfetch", "mitre_lookup",
+                "library_search", "library_get", "library_related",
+                "library_target_history", "library_evidence")
 )
 
 _CHAT_TOOL_DOCS = "\n".join(
     f"- {name}({', '.join(params)}): {desc}"
     for name, (_, params, desc) in T.TOOLS.items()
     if name in ("webfetch", "search_vuln", "fetch_cve_detail",
-                "version_match", "list_pocs", "get_poc", "run_poc_check", "mitre_lookup")
+                "version_match", "list_pocs", "get_poc", "run_poc_check", "mitre_lookup",
+                "library_search", "library_get", "library_related",
+                "library_target_history", "library_evidence", "library_note")
 )
 
 RESEARCH_SYSTEM = f"""You are a vulnerability-research agent (al/glm-5.2). You have FULL CONTROL: you decide
@@ -46,6 +50,8 @@ GROUNDING + ACCURACY RULES (never break):
 7. Every finding cites its source.
 8. STRICT - NO CREDENTIAL BRUTE-FORCING. Never brute-force usernames/passwords/login forms or do
    password spraying. Path/file/directory/parameter enumeration is allowed.
+9. READ-ONLY: never write to the library. library_note and other write tools are chat-only
+   (owned by the report/chat model) — you only search/read (library_search/get/related/evidence).
 
 WORKFLOW:
 1. detect_stack(url) -> stack + waf.
@@ -404,6 +410,9 @@ Rules:
 - Use Telegram HTML ONLY: <b> <i> <u> <s> <code> <pre> <a href="..."> <blockquote>. NO <br>/<p>/<div>/
   <span>/<strong>/<em>/<ul>/<li>/markdown/fences. Use plain newlines; <b>/<i> not <strong>/<em>.
 - Call tools only when needed. Max ~4 tool calls/turn.
+- Library tools give private intel: library_search/library_get/library_related/library_evidence/
+  library_target_history for research, library_note to save a user note (requires the user's
+  numeric user_id — if you don't know it, don't guess; the library validates ownership).
 
 Tools:
 {_CHAT_TOOL_DOCS}

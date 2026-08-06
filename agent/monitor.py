@@ -114,6 +114,7 @@ class VulnMonitor:
         new_cves = [c for c in new_cves if c["cve"].upper() not in sent_set]
         if not new_cves:
             log.info("monitor: no new CVEs this cycle")
+            await self._refresh_library()  # bounded stale-entry refresh still runs
             return
 
         # 3. Limit to max per cycle
@@ -126,6 +127,38 @@ class VulnMonitor:
                 await self._process_cve(cve_info)
             except Exception as e:
                 log.exception("monitor: error processing %s: %s", cve_info.get("cve"), e)
+        # bounded library refresh: re-fetch stale/missing entries — fail-soft
+        await self._refresh_library()
+
+    # ---------------- private library (supplement, never a dependency) ----------------
+    # The local intelligence library (root library.py) is a continuously-improving
+    # supplement to live feeds. Every call here is best-effort and degrades to a log
+    # line, so monitor cycles never break when the library is absent or slow.
+
+    async def _lib_ingest(self, cve_info: dict, analysis: Optional[dict], detail: str):
+        """Best-effort: ingest one CVE's feed/advisory facts + processed analysis into
+        the private library (upsert by canonical ID). Fail-soft — never blocks a cycle."""
+        try:
+            import library as _lib
+            rec = dict(cve_info or {})
+            # drop noise from failed fetches; keep the feed facts (cve/title/sev/cvss/source)
+            d = (detail or "").strip()
+            if not d or d.startswith("ERR:") or d.startswith("tool ") or " ERR " in d[:20]:
+                d = ""
+            await _lib.ingest_monitor(rec, analysis=analysis, detail=d[:30000])
+        except Exception as e:
+            log.warning("monitor: library ingest skipped for %s: %s",
+                        (cve_info or {}).get("cve"), e)
+
+    async def _refresh_library(self):
+        """Bounded refresh of stale/missing library entries (limit 5/cycle) so the
+        library continuously improves. Fail-soft — never blocks or breaks the cycle."""
+        try:
+            import library as _lib
+            n = await _lib.refresh_due(limit=5)
+            log.info("monitor: library refresh_due -> %r", n)
+        except Exception as e:
+            log.warning("monitor: library refresh_due skipped: %s", e)
 
     async def _fetch_feed_cves(self) -> list[dict]:
         """Fetch latest CVEs from feed-based scrapers. Returns list of {cve, title, severity, cvss, source}.
@@ -243,6 +276,8 @@ class VulnMonitor:
             await asyncio.sleep(0.3)  # yield
         if extra_ctx:
             detail = detail + "\n\n=== ADVISORY/PATCH/SOURCE CONTEXT (fetched) ===" + extra_ctx
+        # library: record the feed/advisory facts (no analysis yet) — fail-soft
+        await self._lib_ingest(cve_info, None, detail)
 
         # b. check nuclei template
         poc_status = "N/A"
@@ -261,6 +296,8 @@ class VulnMonitor:
         # c. AI analysis (1 LLM call)
         analysis = await self._ai_analyze(cve, detail, cve_info)
         await asyncio.sleep(0.3)  # yield
+        # library: record the processed analysis (summary/rce/auth/dorks) — fail-soft
+        await self._lib_ingest(cve_info, analysis, detail)
 
         # d. format + send Telegram report
         report = self._format_report(cve, cve_info, analysis, poc_status, poc_path, detail)

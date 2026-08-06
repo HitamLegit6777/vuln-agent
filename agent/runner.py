@@ -19,9 +19,27 @@ from agent.tools import dispatch as _dispatch
 from agent import scoring as _scoring
 from scrapers import cvss as _cvss
 import db as _db
+import logging
 
+
+log = logging.getLogger("vuln-runner")
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.S)
 _CHAT_MAX_STEPS = 12
+_RESEARCH_TOOLS = frozenset({
+    "detect_stack", "search_vuln", "fetch_cve_detail", "version_match", "webfetch",
+    "mitre_lookup", "library_search", "library_get", "library_related",
+    "library_target_history", "library_evidence",
+})
+_POC_TOOLS = frozenset({
+    "webfetch", "fetch_cve_detail", "version_match", "save_poc", "list_pocs",
+    "get_poc", "run_poc_check", "mitre_lookup", "library_search", "library_get",
+    "library_related", "library_evidence",
+})
+_CHAT_TOOLS = frozenset({
+    "webfetch", "search_vuln", "fetch_cve_detail", "version_match", "list_pocs",
+    "get_poc", "run_poc_check", "mitre_lookup", "library_search", "library_get",
+    "library_related", "library_target_history", "library_evidence", "library_note",
+})
 
 
 def _first_balanced_json(text: str) -> Optional[dict]:
@@ -142,6 +160,120 @@ _RESEARCH_FORCE_NUDGE_AT = 10
 _PRE_FETCH_CAP = 20        # max CVE-detail fetches in pre-research (each = full 14-source get_all)
 
 
+# ---------------- private library: prior context + record ingestion ----------------
+# The local intelligence library (root library.py) is STRICTLY a supplement to live
+# sources: every call is best-effort and degrades to a log line, so scans never depend
+# on it. Facts pulled from it are labeled PRIVATE LIBRARY EVIDENCE (local priors, may
+# be stale); live sources keep precedence. Record-level ingestion only (no user_id
+# available here) — scan-level persistence lives in bot.py where user_id exists.
+
+
+def _lib_compact(d, maxlen: int = 280) -> str:
+    """Render a library record compactly for prompt context. Defensive about key names
+    (the library schema may evolve — never let formatting crash a scan)."""
+    if not isinstance(d, dict):
+        return str(d)[:maxlen]
+    def _g(*keys):
+        for k in keys:
+            v = d.get(k)
+            if v not in (None, "", [], {}):
+                return v
+        return None
+    cve = _g("cve", "canonical_id", "id")
+    status = _g("label", "status", "state")
+    sev = _g("severity", "risk")
+    cvss = _g("cvss", "cvss_score")
+    title = _g("title", "name", "summary", "description")
+    aff = _g("component", "affected", "affected_versions", "product")
+    ts = _g("updated", "updated_at", "observed", "observed_at", "created")
+    parts = []
+    if cve:
+        parts.append(str(cve))
+    if status:
+        parts.append(str(status).upper())
+    sev_s = f"{sev}{f' {cvss}' if cvss else ''}".strip() if (sev or cvss) else ""
+    if sev_s:
+        parts.append(sev_s)
+    if title:
+        parts.append(str(title)[:150])
+    if aff:
+        parts.append(f"affects: {str(aff)[:80]}")
+    if ts:
+        parts.append(f"updated: {str(ts)[:16]}")
+    return " | ".join(parts)[:maxlen] or "(empty record)"
+
+
+async def _library_context(search_items: list, cves: list) -> str:
+    """Bounded, best-effort retrieval of private-library facts for the detected
+    components and candidate CVEs. Returns a clearly-labeled compact block, or ''
+    when the library is unavailable (scans never block on it)."""
+    try:
+        import library as _lib
+    except Exception as e:
+        log.info("library unavailable (prior context skipped): %s", e)
+        return ""
+    lines = []
+    # component-level: semantic-ish search over the local corpus (cap 6)
+    for name, version in search_items[:6]:
+        try:
+            q = f"{name} {version}".strip() if version else str(name)
+            hits = await _lib.search(q, limit=2)
+            for h in (hits or []):
+                lines.append(f"- [search:{name}] {_lib_compact(h)}")
+        except Exception as e:
+            log.debug("library search %r failed: %s", name, e)
+    # CVE-level: exact prior facts for the top candidates (cap 10)
+    for cve in cves[:10]:
+        try:
+            g = await _lib.get_vulnerability(cve)
+            if g:
+                lines.append(f"- [cve:{cve}] {_lib_compact(g)}")
+        except Exception as e:
+            log.debug("library get %s failed: %s", cve, e)
+    if not lines:
+        return ""
+    return ("\n=== PRIVATE LIBRARY EVIDENCE (local prior facts from this agent's library; "
+            "may be stale — LIVE SOURCES in this prompt take precedence) ===\n"
+            + "\n".join(lines) + "\n")
+
+
+async def _ingest_library_vulns(findings: dict) -> None:
+    """Best-effort: record complete candidate facts (CVE, component, version, severity,
+    sources) into the private library. Record-level only — no user_id needed here;
+    scan-level persistence (report/scan rows, needs user_id) lives in bot.py.
+    Never breaks a scan: every failure degrades to a log line."""
+    vulns = [v for v in (findings.get("vulnerabilities") or []) if v.get("cve")]
+    if not vulns:
+        return
+    try:
+        import library as _lib
+    except Exception as e:
+        log.info("library unavailable (ingest skipped): %s", e)
+        return
+    for v in vulns[:20]:  # bounded — never let the library stall a scan
+        try:
+            record = {
+                "cve": str(v["cve"]).upper(),
+                "label": v.get("label"),
+                "component": v.get("component"),
+                "version": v.get("version"),
+                "title": v.get("title"),
+                "severity": v.get("severity"),
+                "cvss": v.get("cvss"),
+                "sources": v.get("sources") or [],
+                "url": v.get("url"),
+            }
+            await _lib.ingest_vulnerability(
+                record,
+                source_name="research",
+                source_url=v.get("url") or findings.get("target", ""),
+                raw=json.dumps(record, ensure_ascii=False, default=str)[:20000],
+                inference=None,
+            )
+        except Exception as e:
+            log.warning("library ingest %s skipped: %s", v.get("cve"), e)
+
+
 async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
     """Phase 1: detect stack + parallel search_vuln + parallel fetch_cve_detail.
     Returns (pre_research_text, stack_data, precomputed_vulns) — all pre-computed.
@@ -234,6 +366,14 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
     fetch_tasks = [_fetch(cve) for cve in cves_to_fetch]
     fetch_results = await asyncio.gather(*fetch_tasks)
 
+    # 1d. private-library prior context: compact local facts for detected components +
+    # candidate CVEs — supplement only; live sources above keep precedence. Fail-soft.
+    try:
+        lib_ctx = await _library_context(search_items, cves_to_fetch)
+    except Exception as e:
+        log.warning("library prior context failed: %s", e)
+        lib_ctx = ""
+
     # compile pre-research context
     search_ctx = "\n\n---\n\n".join(
         f"search_vuln({name}, {ver}):\n{result[:3000]}"
@@ -244,7 +384,10 @@ async def _pre_research(target: str, progress=None) -> tuple[str, dict, dict]:
         for cve, detail in fetch_results
     )
     pre_research = f"STACK:\n{stack_obs[:4000]}\n\nSEARCH RESULTS:\n{search_ctx[:15000]}\n\nCVE DETAILS:\n{detail_ctx[:15000]}"
+    if lib_ctx:
+        pre_research += "\n\n" + lib_ctx
     return pre_research, stack_data, precomputed_vulns
+
 
 
 async def run_research(target: str,
@@ -311,7 +454,7 @@ async def run_research(target: str,
         obj = _extract_json(resp)
         if obj and "tool" in obj and "args" in obj:
             name = obj["tool"]; args = obj.get("args") or {}
-            obs = await _dispatch(name, args)
+            obs = await _dispatch(name, args, allowed=_RESEARCH_TOOLS)
             messages.append({"role": "user", "content": f"OBSERVATION({name}):\n{obs[:6000]}"})
             transcript.append(f"  -> {name}({args}) => {obs[:160]}")
             if step + 1 >= _RESEARCH_FORCE_NUDGE_AT:
@@ -326,6 +469,10 @@ async def run_research(target: str,
                 obj["waf"] = acc["waf"]
                 obj["waf_summary"] = acc.get("waf_summary", "")
                 obj["waf_may_mask"] = acc.get("waf_may_mask", False)
+            try:
+                await _ingest_library_vulns(obj)
+            except Exception as e:
+                log.warning("library ingest skipped: %s", e)
             return json.dumps(obj, ensure_ascii=False), "\n".join(transcript)
         messages.append({"role": "user",
             "content": "Respond with a tool call {\"tool\":..,\"args\":..} OR the findings JSON object."})
@@ -340,6 +487,10 @@ async def run_research(target: str,
                 "waf": acc.get("waf", []),
                 "waf_summary": acc.get("waf_summary", ""),
                 "waf_may_mask": acc.get("waf_may_mask", False)}
+    try:
+        await _ingest_library_vulns(fallback)
+    except Exception as e:
+        log.warning("library ingest skipped: %s", e)
     return json.dumps(fallback, ensure_ascii=False), "\n".join(transcript)
 
 
@@ -768,7 +919,7 @@ async def run_poc(scan_id: str, cve: str, target: str) -> dict:
         obj = _extract_json(resp)
         if obj and "tool" in obj and "args" in obj:
             name = obj["tool"]; args = obj.get("args") or {}
-            obs = await _dispatch(name, args)
+            obs = await _dispatch(name, args, allowed=_POC_TOOLS)
             if name == "run_poc_check":
                 last_run_output = obs
                 methods_tried.append(f"run #{sum(1 for m in methods_tried if m.startswith('run'))+1}")
@@ -872,7 +1023,7 @@ async def run_self_reflect(target: str, findings: str, scan_id: str) -> str:
 # ---------------- chat (deepseek-v4-pro, per scan_id) ----------------
 
 async def run_chat(scan_id: str, grounded: str, findings: str,
-                   question: str, history: list[dict]) -> tuple[str, list[dict]]:
+                   question: str, history: list[dict], user_id: Optional[int] = None) -> tuple[str, list[dict]]:
     sys = bp.build_chat_system(scan_id, grounded or "", findings or "")
     # work on a copy — never mutate the caller's list (aliasing bug)
     history = list(history or [])
@@ -885,8 +1036,12 @@ async def run_chat(scan_id: str, grounded: str, findings: str,
         messages.append({"role": "assistant", "content": resp})
         obj = _extract_json(resp)
         if obj and "tool" in obj and "args" in obj:
-            obs = await _dispatch(obj["tool"], obj.get("args") or {})
-            messages.append({"role": "user", "content": f"OBSERVATION({obj['tool']}):\n{obs[:5000]}"})
+            tool_name = obj["tool"]
+            tool_args = obj.get("args") or {}
+            if tool_name == "library_note" and user_id is not None:
+                tool_args["user_id"] = user_id
+            obs = await _dispatch(tool_name, tool_args, allowed=_CHAT_TOOLS)
+            messages.append({"role": "user", "content": f"OBSERVATION({tool_name}):\n{obs[:5000]}"})
             continue
         answer = resp  # plain-text answer
         break

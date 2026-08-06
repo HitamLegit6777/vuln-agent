@@ -5,6 +5,7 @@ Uses rich HTML messages + inline buttons. Whitelist-gated.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -111,7 +112,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<code>/feedback &lt;scan_id&gt; good|bad|wrong</code> — rate a scan (self-improvement)\n"
         "<code>/knowledge</code> — liat knowledge yg bot udah pelajarin\n"
         "<code>/model [detect|report &lt;id&gt;|list|reset]</code> — switch AI model\n"
-        "<code>/monitor on|off|list|check</code> — vuln monitor (hourly new CVE alerts)")
+        "<code>/monitor on|off|list|check</code> — vuln monitor (hourly new CVE alerts)\n"
+        "<code>/library [stats|search|cve|related|target|evidence|recent|exploitable|note|refresh|export|verify]</code> — intel library pribadi")
 
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -171,6 +173,13 @@ async def _run_scan_bg(update: Update, bot, user_id: int, target: str, scan_id: 
         await db.save_scan(scan_id, user_id, target,
                            findings_obj.get("stack", []), findings_obj, report,
                            grounded=findings_str)
+        # Persist canonical facts, target snapshot, drift and per-target evidence.
+        # The scan itself remains successful if the private library is unavailable.
+        try:
+            from library import ingest_scan
+            await ingest_scan(user_id, scan_id, target, findings_obj, report)
+        except Exception:
+            log.exception("private library scan ingest failed")
         # SELF-IMPROVEMENT: AI reflects on the scan and writes lessons learned
         try:
             lessons = await runner.run_self_reflect(target, findings_str, scan_id)
@@ -233,7 +242,10 @@ async def cmd_poc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not scan_id:
         scan_id = "adhoc"
     # target from the scan row (needed to run --check exploitability)
-    row = await db.get_scan(scan_id) if scan_id != "adhoc" else None
+    row = (await db.get_scan_for_user(scan_id, update.effective_user.id)
+           if scan_id != "adhoc" else None)
+    if scan_id != "adhoc" and not row:
+        return await update.effective_message.reply_text("Scan not found or not owned by you.")
     target = row["target"] if row else ""
     msg = await update.effective_message.reply_html(f"<i>Generating PoC for</i> <code>{_e(cve)}</code>…")
     try:
@@ -301,7 +313,7 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await _unauthorized(update)
     if not ctx.args:
         return await update.effective_message.reply_html("Usage: <code>/report &lt;scan_id&gt;</code>")
-    row = await db.get_scan(ctx.args[0])
+    row = await db.get_scan_for_user(ctx.args[0], update.effective_user.id)
     if not row:
         return await update.effective_message.reply_text("Scan not found.")
     report = json.loads(row["report"]) if row.get("report") else {}
@@ -433,7 +445,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Tanpa pertanyaan → masuk mode chat (ketik bebas). <code>/end</code> utk keluar.")
     scan_id = ctx.args[0]
     question = " ".join(ctx.args[1:]).strip()
-    row = await db.get_scan(scan_id)
+    row = await db.get_scan_for_user(scan_id, update.effective_user.id)
     if not row:
         return await update.effective_message.reply_text("Scan ID tidak ditemukan.")
     _active_chat[update.effective_user.id] = scan_id
@@ -467,7 +479,7 @@ _chat_locks: dict[int, asyncio.Lock] = {}  # per-user chat serialization (lost-u
 
 
 async def _do_chat(update: Update, scan_id: str, question: str):
-    row = await db.get_scan(scan_id)
+    row = await db.get_scan_for_user(scan_id, update.effective_user.id)
     if not row:
         return await update.effective_message.reply_text("Scan ID tidak ditemukan.")
     uid = update.effective_user.id
@@ -479,7 +491,7 @@ async def _do_chat(update: Update, scan_id: str, question: str):
             history = await db.get_chat(scan_id)
             answer, history = await runner.run_chat(
                 scan_id, row.get("grounded") or "", row.get("findings") or "",
-                question, history)
+                question, history, user_id=uid)
             await db.save_chat(scan_id, history)
         try:
             await msg.delete()
@@ -593,27 +605,33 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_poc(update, ctx)
     elif data.startswith("pocs:"):
         _, scan_id = data.split(":", 1)
-        row = await db.get_scan(scan_id)
+        row = await db.get_scan_for_user(scan_id, update.effective_user.id)
+        if not row:
+            return await q.message.reply_text("Scan not found or not owned by you.")
         report = json.loads(row["report"]) if row and row.get("report") else {}
         await q.edit_message_reply_markup(
             reply_markup=_poc_menu_kb(scan_id, _report_cves(report)))
     elif data.startswith("back:"):
         _, scan_id = data.split(":", 1)
-        row = await db.get_scan(scan_id)
+        row = await db.get_scan_for_user(scan_id, update.effective_user.id)
+        if not row:
+            return await q.message.reply_text("Scan not found or not owned by you.")
         report = json.loads(row["report"]) if row and row.get("report") else {}
         await q.edit_message_reply_markup(
             reply_markup=_main_kb(scan_id, _report_cves(report)))
     elif data.startswith("chat:"):
         _, scan_id = data.split(":", 1)
+        row = await db.get_scan_for_user(scan_id, update.effective_user.id)
+        if not row:
+            return await q.message.reply_text("Scan not found or not owned by you.")
         _active_chat[update.effective_user.id] = scan_id
-        row = await db.get_scan(scan_id)
-        tgt = _e(row.get("target")) if row else "?"
+        tgt = _e(row.get("target"))
         await q.message.reply_html(
             f"Mode chat aktif utk scan <code>{_e(scan_id)}</code> ({tgt}).\n"
             f"Ketik pertanyaan apa saja. <code>/end</code> utk keluar.")
     elif data.startswith("rescan:"):
         _, scan_id = data.split(":", 1)
-        row = await db.get_scan(scan_id)
+        row = await db.get_scan_for_user(scan_id, update.effective_user.id)
         if row:
             ctx.args = [row["target"]]
             await cmd_scan(update, ctx)
@@ -725,6 +743,341 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons))
 
 
+# ============ /library — private intelligence library UI ============
+
+_LIB_HELP = (
+    "<b>Library Vuln Intelligence</b> — knowledge base pribadi: hasil scan, "
+    "monitor CVE, dan intel dari sumber eksternal.\n\n"
+    "<b>Subcommands:</b>\n"
+    "<code>/library stats</code> — ringkasan isi library\n"
+    "<code>/library search &lt;query&gt;</code> — cari vulnerability (semantic)\n"
+    "<code>/library cve &lt;CVE-ID&gt;</code> — detail satu vulnerability\n"
+    "<code>/library related &lt;CVE-ID|query&gt;</code> — vulnerability mirip/terkait\n"
+    "<code>/library target &lt;url|host&gt;</code> — riwayat scan target milik kamu\n"
+    "<code>/library evidence &lt;CVE-ID&gt;</code> — evidence/bukti utk CVE (milik kamu)\n"
+    "<code>/library recent [n]</code> — vulnerability terbaru (default 10)\n"
+    "<code>/library exploitable</code> — yang ber-status exploitable (by CVSS)\n"
+    "<code>/library note &lt;CVE-ID&gt; &lt;catatan&gt;</code> — catatan pribadi\n"
+    "<code>/library refresh [CVE-ID]</code> — refresh data (yg overdue / satu CVE)\n"
+    "<code>/library export</code> — export semua data sebagai JSONL (file)\n"
+    "<code>/library verify</code> — verifikasi integritas DB library"
+)
+
+
+def _library_module():
+    """Lazy import of root library.py — stays importable while the module bootstraps."""
+    try:
+        import library as _lib
+        return _lib
+    except Exception:
+        return None
+
+
+async def _lib(fn_name: str, *args, **kw):
+    """Call one async library function by name. Raises clear errors when unavailable."""
+    lib = _library_module()
+    if lib is None:
+        raise RuntimeError("library module tidak tersedia")
+    fn = getattr(lib, fn_name, None)
+    if fn is None:
+        raise LookupError(f"library.{fn_name}() belum diimplementasikan")
+    return await fn(*args, **kw)
+
+
+def _vrow(v: dict) -> str:
+    """One compact HTML line for a vulnerability row."""
+    cid = v.get("canonical_id") or v.get("id") or v.get("cve") or "?"
+    sev = (v.get("severity") or "UNKNOWN").upper()
+    line = f"<code>{_e(cid)}</code> [<b>{_e(sev)}</b>"
+    cvss = v.get("cvss")
+    if isinstance(cvss, (int, float)):
+        line += f" {cvss}"
+    line += "]"
+    title = v.get("title") or v.get("summary") or "-"
+    line += f" {_e(str(title))[:120]}"
+    if v.get("kev") or v.get("in_kev"):
+        line += " · <b>KEV</b>"
+    if v.get("exploitable"):
+        line += " · <b>EXPLOITABLE</b>"
+    upd = v.get("updated") or v.get("published")
+    if upd:
+        line += f"\n<i>{_e(str(upd))}</i>"
+    return line
+
+
+def _vdetail(v: dict) -> list[str]:
+    """Full detail for one vulnerability → list of HTML blocks."""
+    cid = v.get("canonical_id") or v.get("id") or v.get("cve") or "?"
+    sev = (v.get("severity") or "UNKNOWN").upper()
+    head = f"<b>{_e(cid)}</b>  [{_e(sev)}"
+    cvss = v.get("cvss")
+    if isinstance(cvss, (int, float)):
+        head += f" CVSS {cvss}"
+    epss = v.get("epss")
+    if isinstance(epss, (int, float)):
+        head += f" · EPSS {epss:.0%}"
+    head += "]"
+    if v.get("kev") or v.get("in_kev"):
+        head += " · <b>KEV</b>"
+    if v.get("exploitable"):
+        head += " · <b>EXPLOITABLE</b>"
+    parts = [head]
+    for label, key in (("Title", "title"), ("Summary", "summary"),
+                       ("Description", "description"), ("Affects", "affects"),
+                       ("Component", "component"), ("Status", "status"),
+                       ("PoC", "poc_status")):
+        val = v.get(key)
+        if val:
+            parts.append(f"<b>{label}:</b> {_e(str(val))[:600]}")
+    refs = v.get("references") or v.get("refs") or v.get("urls")
+    if refs:
+        if not isinstance(refs, list):
+            refs = [refs]
+        links = [f'<a href="{_e(u)}">link{i+1}</a>'
+                 for i, u in enumerate(refs[:5]) if str(u).startswith("http")]
+        if links:
+            parts.append("<b>References:</b> " + " | ".join(links))
+    srcs = v.get("sources")
+    if srcs:
+        if isinstance(srcs, str):
+            srcs = [srcs]
+        parts.append(f"<b>Sources:</b> {_e(', '.join(str(s) for s in srcs[:5]))}")
+    upd = v.get("updated")
+    if upd:
+        parts.append(f"<b>Updated:</b> {_e(str(upd))}")
+    return parts
+
+
+def _erow(e: dict) -> str:
+    """One compact HTML line for an evidence/observation row."""
+    kind = e.get("kind") or e.get("type") or "observation"
+    detail = e.get("detail") or e.get("content") or e.get("note") or e.get("value") or "-"
+    src = e.get("source") or e.get("source_name") or ""
+    ts = e.get("observed_at") or e.get("created") or e.get("created_at") or ""
+    line = f"<b>{_e(str(kind))}</b>"
+    if src:
+        line += f" · {_e(str(src))}"
+    if ts:
+        line += f" · {_e(str(ts))}"
+    line += f"\n{_e(str(detail))[:400]}"
+    return line
+
+
+def _srow(r: dict) -> str:
+    """One compact HTML line for a scan-history row."""
+    sid = r.get("scan_id") or r.get("id") or "?"
+    tgt = r.get("target") or "-"
+    ts = r.get("created") or r.get("created_at") or r.get("observed_at") or ""
+    status = r.get("status") or ""
+    line = f"<code>{_e(sid)}</code> — {_e(str(tgt))}"
+    if status:
+        line += f" ({_e(str(status))})"
+    if ts:
+        line += f" · {_e(str(ts))}"
+    summary = r.get("summary") or r.get("report_status") or ""
+    if summary:
+        line += f"\n<i>{_e(str(summary))[:150]}</i>"
+    return line
+
+
+async def _send_html(update: Update, text: str):
+    """Send HTML text, auto-split into bounded Telegram messages."""
+    for ch in _split_html(text, 3500):
+        await update.effective_message.reply_html(ch, disable_web_page_preview=True)
+
+
+async def cmd_library(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _gate(update):
+        return await _unauthorized(update)
+    args = list(ctx.args or [])
+    if not args:
+        return await update.effective_message.reply_html(_LIB_HELP)
+    sub = args[0].lower()
+    uid = update.effective_user.id
+    handlers = {
+        "stats": _lib_stats, "search": _lib_search, "cve": _lib_cve,
+        "related": _lib_related, "target": _lib_target, "evidence": _lib_evidence,
+        "recent": _lib_recent, "exploitable": _lib_exploitable, "note": _lib_note,
+        "refresh": _lib_refresh, "export": _lib_export, "verify": _lib_verify,
+    }
+    fn = handlers.get(sub)
+    if fn is None:
+        return await update.effective_message.reply_html(
+            f"Subcommand tidak dikenal: <code>{_e(sub)}</code>\n\n{_LIB_HELP}")
+    try:
+        await fn(update, uid, args[1:])
+    except Exception as e:
+        log.exception("library %s failed", sub)
+        await update.effective_message.reply_html(
+            f"<b>Library error ({sub}):</b> {_e(type(e).__name__)}: {_e(e)}")
+
+
+async def _lib_stats(update: Update, uid: int, args: list):
+    st = await _lib("stats", uid)
+    if not isinstance(st, dict):
+        return await update.effective_message.reply_html(f"<b>Library stats:</b> {_e(st)}")
+    lines = ["<b>Library stats</b>"]
+    for k, v in st.items():
+        if isinstance(v, (list, dict)):
+            v = json.dumps(v, ensure_ascii=False)[:300]
+        lines.append(f"<b>{_e(str(k))}:</b> {_e(v)}")
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_search(update: Update, uid: int, args: list):
+    if not args:
+        return await update.effective_message.reply_html(
+            "Usage: <code>/library search &lt;query&gt;</code>")
+    query = " ".join(args)
+    rows = await _lib("search", query, 10) or []
+    if not rows:
+        return await update.effective_message.reply_html(
+            f"<i>Tidak ada hasil utk</i> <code>{_e(query)}</code><i>.</i>")
+    lines = [f"<b>Search:</b> {_e(query)} ({len(rows)} hasil)\n"]
+    lines += [f"{i}. {_vrow(v)}" for i, v in enumerate(rows, 1)]
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_cve(update: Update, uid: int, args: list):
+    if not args:
+        return await update.effective_message.reply_html(
+            "Usage: <code>/library cve &lt;CVE-ID&gt;</code>\n"
+            "<i>Contoh:</i> <code>/library cve CVE-2024-1234</code>")
+    cid = args[0].upper()
+    v = await _lib("get_vulnerability", cid)
+    if not v:
+        return await update.effective_message.reply_html(
+            f"<i>Vulnerability tidak ditemukan:</i> <code>{_e(cid)}</code>")
+    await _send_html(update, "\n\n".join(_vdetail(v)))
+
+
+async def _lib_related(update: Update, uid: int, args: list):
+    if not args:
+        return await update.effective_message.reply_html(
+            "Usage: <code>/library related &lt;CVE-ID | query&gt;</code>")
+    q = " ".join(args)
+    if q.upper().startswith("CVE-"):
+        q = q.upper()
+    rows = await _lib("related", q, 5) or []
+    if not rows:
+        return await update.effective_message.reply_html(
+            f"<i>Tidak ada CVE terkait utk</i> <code>{_e(q)}</code><i>.</i>")
+    lines = [f"<b>Terkait:</b> {_e(q)}\n"]
+    lines += [f"{i}. {_vrow(v)}" for i, v in enumerate(rows, 1)]
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_target(update: Update, uid: int, args: list):
+    if not args:
+        return await update.effective_message.reply_html(
+            "Usage: <code>/library target &lt;url|host&gt;</code> — riwayat scan target milik kamu")
+    tgt = " ".join(args)
+    rows = await _lib("target_history", uid, tgt, 10) or []
+    if not rows:
+        return await update.effective_message.reply_html(
+            f"<i>Belum ada scan utk</i> <code>{_e(tgt)}</code><i> milik kamu.</i>")
+    lines = [f"<b>Riwayat target:</b> {_e(tgt)} ({len(rows)})\n"]
+    lines += [f"{i}. {_srow(r)}" for i, r in enumerate(rows, 1)]
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_evidence(update: Update, uid: int, args: list):
+    if not args:
+        return await update.effective_message.reply_html(
+            "Usage: <code>/library evidence &lt;CVE-ID&gt;</code> — evidence milik kamu utk CVE tsb")
+    cid = args[0].upper()
+    rows = await _lib("get_evidence", cid, uid, 20) or []
+    if not rows:
+        return await update.effective_message.reply_html(
+            f"<i>Belum ada evidence utk</i> <code>{_e(cid)}</code><i> (data milik kamu).</i>")
+    lines = [f"<b>Evidence:</b> {_e(cid)} ({len(rows)})\n"]
+    lines += [f"{i}. {_erow(r)}" for i, r in enumerate(rows, 1)]
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_recent(update: Update, uid: int, args: list):
+    n = 10
+    if args:
+        try:
+            n = max(1, min(int(args[0]), 50))
+        except ValueError:
+            return await update.effective_message.reply_html(
+                "Usage: <code>/library recent [n]</code>  (n = jumlah, maks 50)")
+    rows = await _lib("recent", n) or []
+    if not rows:
+        return await update.effective_message.reply_html("<i>Library masih kosong.</i>")
+    lines = [f"<b>Vulnerability terbaru ({len(rows)}):</b>\n"]
+    lines += [f"{i}. {_vrow(v)}" for i, v in enumerate(rows, 1)]
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_exploitable(update: Update, uid: int, args: list):
+    rows = await _lib("exploitable", 10) or []
+    if not rows:
+        return await update.effective_message.reply_html(
+            "<i>Belum ada vulnerability exploitable.</i>")
+    lines = [f"<b>Exploitable (by CVSS, {len(rows)}):</b>\n"]
+    lines += [f"{i}. {_vrow(v)}" for i, v in enumerate(rows, 1)]
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_note(update: Update, uid: int, args: list):
+    if len(args) < 2:
+        return await update.effective_message.reply_html(
+            "Usage: <code>/library note &lt;CVE-ID&gt; &lt;catatan&gt;</code>\n"
+            "<i>Simpan catatan pribadi yg terhubung ke entity di library.</i>")
+    entity = args[0].upper()
+    note = " ".join(args[1:])
+    res = await _lib("add_note", uid, entity, note)
+    extra = ""
+    if isinstance(res, dict):
+        extra = " " + ", ".join(f"{k}={_e(v)}" for k, v in list(res.items())[:4])
+    elif isinstance(res, str) and res:
+        extra = " " + _e(res[:100])
+    await update.effective_message.reply_html(
+        f"<b>Catatan disimpan</b>\nEntity: <code>{_e(entity)}</code>\nNote: {_e(note[:300])}{extra}")
+
+
+async def _lib_refresh(update: Update, uid: int, args: list):
+    if args:
+        cid = args[0].upper()
+        res = await _lib("refresh_vulnerability", cid)
+        detail = f"\n<i>{_e(str(res)[:200])}</i>" if res else ""
+        return await update.effective_message.reply_html(
+            f"<b>Refresh:</b> <code>{_e(cid)}</code>{detail}")
+    due = await _lib("refresh_due", 5) or []
+    if not due:
+        return await update.effective_message.reply_html(
+            "<i>Tidak ada vulnerability yg perlu di-refresh.</i>")
+    lines = [f"<b>Refresh berjalan utk {len(due)} CVE:</b>\n"]
+    lines += [f"{i}. {_vrow(v)}" for i, v in enumerate(due, 1)]
+    await _send_html(update, "\n".join(lines))
+
+
+async def _lib_export(update: Update, uid: int, args: list):
+    text = await _lib("export_jsonl", uid)
+    if not text:
+        return await update.effective_message.reply_html(
+            "<i>Library kosong — tidak ada data utk export.</i>")
+    data = text.encode("utf-8")
+    await update.effective_message.reply_document(
+        document=io.BytesIO(data),
+        filename="library_export.jsonl",
+        caption=f"Library export JSONL — {len(data)} bytes, {len(text.splitlines())} baris")
+
+
+async def _lib_verify(update: Update, uid: int, args: list):
+    res = await _lib("verify_integrity")
+    if isinstance(res, dict):
+        ok = res.get("ok") or res.get("valid")
+        lines = [f"<b>Integritas library: {'OK' if ok else 'MASALAH'}</b>"]
+        for k, v in res.items():
+            lines.append(f"{_e(str(k))}: {_e(v)}")
+        await _send_html(update, "\n".join(lines))
+    else:
+        await update.effective_message.reply_html(f"<b>Integritas library:</b> {_e(res)}")
+
+
 def main():
     config.assert_configured()
     db.init_db()
@@ -742,6 +1095,16 @@ def main():
             await load_models_from_db()
         except Exception:
             pass
+        # library tables — idempotent. db.init_db() also calls it; keep this so the
+        # bot works even if that hook is missing.
+        try:
+            lib = _library_module()
+            if lib is not None:
+                init = getattr(lib, "init_library", None)
+                if init:
+                    await init()
+        except Exception:
+            log.exception("library init failed")
         _monitor = VulnMonitor(bot=application.bot)
         await _monitor.start()
 
@@ -760,12 +1123,14 @@ def main():
     app.add_handler(CommandHandler("feedback", cmd_feedback))
     app.add_handler(CommandHandler("knowledge", cmd_knowledge))
     app.add_handler(CommandHandler("monitor", cmd_monitor))
+    app.add_handler(CommandHandler("library", cmd_library))
     app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_handler(CommandHandler("end", cmd_end))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     log.info("vuln-agent bot starting…")
     app.run_polling()
+
 
 
 if __name__ == "__main__":

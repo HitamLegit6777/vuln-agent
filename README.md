@@ -19,6 +19,7 @@ AI-powered vulnerability scanner + exploit-research assistant for Telegram.
 - **Self-improvement** — learns detection signatures, PoC patterns, WAF bypasses, and per-CMS lessons across scans.
 - **Switch AI models from Telegram** — `/model` lists provider models and swaps detect/report models at runtime (persisted).
 - **Multi-model cooperation** — a fast detect model (ReAct research) + a report/PoC model, both streamed with hard timeouts + retries.
+- **Private intelligence library** — canonical CVE/advisory facts with source provenance, conflict tracking, FTS5 + deterministic related search, per-target evidence/drift, notes/tags, JSONL import/export, integrity checks, backups, and continuous stale-record refresh.
 
 ---
 
@@ -43,6 +44,7 @@ Telegram bot (bot.py)
   ├── /chat        → persistent per-scan Q&A (history persisted, per-user lock)
   ├── /model       → list/switch detect + report models from the router
   ├── /monitor     → vuln news listener (see below)
+  ├── /library     → private fact library: search/CVE/related/evidence/target drift/notes/export
   └── /feedback /knowledge → self-improvement loop
 
 Vuln monitor (agent/monitor.py)
@@ -62,6 +64,13 @@ Scraper layer (scrapers/)
                (single-flight: concurrent same-key lookups share one scrape)
   each source: BaseScraper with pluggable SQLite cache (TTL 24h)
 ```
+
+Private library (`library.py`, SQLite `lib_*` tables)
+  scan + monitor + live source facts → normalize/deduplicate → canonical facts
+  source claims → provenance + conflict ledger (first-seen canonical fact retained)
+  verified findings → user-scoped evidence + target snapshots + drift
+  FTS5/LIKE + local weighted concept retrieval → agent prior context
+  refresh queue → re-query stale records without blocking scans
 
 ### Pipeline detail
 
@@ -137,6 +146,17 @@ python3 bot.py
 | `/feedback <scan_id> good\|bad\|wrong [note]` | Rate a scan (feeds self-improvement) |
 | `/knowledge` | Show lessons learned from prior scans |
 
+| `/library stats` | Personal library counts, source coverage, conflicts, and stale records |
+| `/library search <query>` | Full-text search over canonical private facts |
+| `/library cve <CVE>` | Canonical fact, affected ranges, provenance, and references |
+| `/library related <CVE\|query>` | Deterministic locally related vulnerability search |
+| `/library target <host>` | User-owned target snapshots and scan drift |
+| `/library evidence <CVE>` | User-scoped scan evidence and observations |
+| `/library note <entity> <text>` | Attach a private note to an entity |
+| `/library refresh [CVE]` | Refresh one or a bounded batch of stale records |
+| `/library export` | Export personal facts/evidence/notes as JSONL |
+| `/library verify` | SQLite integrity and orphan-reference checks |
+
 ---
 
 ## Testing
@@ -146,6 +166,8 @@ python3 -m pytest tests/ -q
 ```
 
 The suite covers: version-range matching, CVSS parsing, EPSS/KEV enrichment, JSON extraction, report rendering/ranking, research fallback, nuclei codegen, probe cookies, DB writers, LLM timeout handling.
+
+The private-library suite additionally covers canonical/source idempotency, provenance conflicts, FTS fallback, conceptual related retrieval, evidence ownership, target drift, notes, JSONL round-trips, refresh failure/success behavior, backups, and integrity checks.
 
 ---
 
